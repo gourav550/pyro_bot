@@ -255,11 +255,12 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("I didn’t understand. " + HELP_TEXT)
 
-async def main():
+def main():
     logging.basicConfig(level=logging.INFO)
-    if TELEGRAM_BOT_TOKEN == "YOUR_TELEGRAM_BOT_TOKEN_HERE":
+    if TELEGRAM_BOT_TOKEN == "8087499535:AAFD-BmoFWao5QC4_zcaZ7spoMF_Pz_Eeb8":
         print("ERROR: Set TELEGRAM_BOT_TOKEN env var or edit the file.")
         return
+
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
@@ -268,9 +269,10 @@ async def main():
     app.add_handler(CommandHandler("reload", reload_cmd))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), text_router))
 
-    print("✅ Bot ready.")
-    await app.run_polling()
+    # run_polling manages its own event loop; do NOT await it
+    app.run_polling()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
+
 
