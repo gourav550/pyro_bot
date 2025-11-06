@@ -14,7 +14,7 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
 # ==== CONFIG ====
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN_HERE")
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "8087499535:AAFD-BmoFWao5QC4_zcaZ7spoMF_Pz_Eeb8")
 REPORT_PATH = os.environ.get("REPORT_PATH", "pyrolysis_feed_temp_ZONE_TIME_report.xlsx")
 ZONE_SHEET = "ZoneTime_Recommendations"  # sheet inside the report
 
@@ -273,3 +273,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
