@@ -14,7 +14,7 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
 # ==== CONFIG ====
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "8087499535:AAFD-BmoFWao5QC4_zcaZ7spoMF_Pz_Eeb8")
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")  # <-- no default!
 REPORT_PATH = os.environ.get("REPORT_PATH", "pyrolysis_feed_temp_ZONE_TIME_report.xlsx")
 ZONE_SHEET = "ZoneTime_Recommendations"  # sheet inside the report
 
@@ -257,9 +257,11 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     logging.basicConfig(level=logging.INFO)
-    if TELEGRAM_BOT_TOKEN == "8087499535:AAFD-BmoFWao5QC4_zcaZ7spoMF_Pz_Eeb8":
+
+    if not TELEGRAM_BOT_TOKEN:   # <-- check for missing token ONLY
         print("ERROR: Set TELEGRAM_BOT_TOKEN env var or edit the file.")
         return
+
 
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
@@ -274,5 +276,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
