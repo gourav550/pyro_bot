@@ -1,8 +1,6 @@
 python-telegram-bot[job-queue]==21.4
+apscheduler==3.10.4
 pandas
 numpy
 openpyxl
 matplotlib==3.9.0
-
-
-
