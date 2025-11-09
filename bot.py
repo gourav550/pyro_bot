@@ -60,7 +60,7 @@ state = {
     "weights": { "radial": 0.045, "nylon": 0.035, "chips": 0.041, "powder": 0.028, "kachra": 0.03, "others": 0.03 },
 }
 
- load_state():
+ load_state()
     try:
         if os.path.exists(STATE_FILE):
             state.update(json.load(open(STATE_FILE,"r",encoding="utf-8")))
@@ -574,4 +574,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
