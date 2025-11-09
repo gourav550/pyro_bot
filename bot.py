@@ -550,29 +550,20 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
-    if not TELEGRAM_BOT_TOKEN:
-        print("ERROR: Set TELEGRAM_BOT_TOKEN env var.")
-        return
+    print("🚀 Starting PyroVision Assistant...")
+    load_state()
+
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(CommandHandler("reload", reload_cmd))
-    app.add_handler(CommandHandler("plan", plan_cmd))
-    app.add_handler(CommandHandler("whatif", whatif_cmd))
-    app.add_handler(CommandHandler("actual", actual_cmd))
-    app.add_handler(CommandHandler("status", status_cmd))
-    app.add_handler(CommandHandler("chart", chart_cmd))
-    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), text_router))
-    app.add_handler(MessageHandler(filters.Document.MimeType("text/csv"), chart_cmd))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("plan", plan_feed))
+    app.add_handler(CommandHandler("actual", actual_output))
+    app.add_handler(CommandHandler("reload", reload_excel))
+    app.add_handler(CommandHandler("status", status_report))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
 
-    # Schedule daily summary at 21:35 IST (or env override)
     schedule_daily_summary(app)
 
-    log.info("Bot starting…")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
-
-if __name__ == "__main__":
-    main()
-
-
+    print("✅ Bot ready. Running polling loop.")
+    app.run_polling()
