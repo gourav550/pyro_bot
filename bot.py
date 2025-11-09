@@ -1,6 +1,7 @@
 # bot.py
 # Telegram bot for tyre-pyrolysis: Feed -> zone plan (minutes); Actual -> compare vs plan.
-# Now supports multi-group routing (machine groups -> summary group) with metadata.
+# Multi-group routing: replies in the machine group AND mirrors to a summary group.
+# Metadata supported: operator, date, machine, batch.
 # Requires: python-telegram-bot >= 21, pandas, numpy, openpyxl
 
 import os
@@ -14,18 +15,18 @@ import pandas as pd
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
-# ===================== CONFIG =====================
+# ===================== CONFIG (set on Railway) =====================
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 REPORT_PATH = os.environ.get("REPORT_PATH", "pyrolysis_feed_temp_ZONE_TIME_report.xlsx")
 ZONE_SHEET = os.environ.get("ZONE_SHEET", "ZoneTime_Recommendations")
 
-# Summary group chat id (post copies here)
-SUMMARY_CHAT_ID = os.environ.get("SUMMARY_CHAT_ID", "")  # e.g. "-1001234567890"
+# Summary group chat id (post copies here), e.g. "-1001234567890"
+SUMMARY_CHAT_ID = os.environ.get("SUMMARY_CHAT_ID", "")
 
-# Map of machine group chat_id -> machine label.
-# Set env MACHINE_MAP to a JSON string, e.g.:
-# {"-100111...":"Machine 1296 (R-1)","-100222...":"Machine 1297 (R-2)","-100333...":"Machine 1298 (R-3)","-100444...":"Machine 1299 (R-4)"}
+# Map of machine group chat_id -> machine label (JSON string)
+# Example value for MACHINE_MAP env var:
+# {"-1001111111111":"Machine 1296 (R-1)","-1002222222222":"Machine 1297 (R-2)","-1003333":"Machine 1298 (R-3)","-1004444":"Machine 1299 (R-4)"}
 MACHINE_MAP = {}
 _raw_map = os.environ.get("MACHINE_MAP", "")
 if _raw_map:
@@ -34,15 +35,7 @@ if _raw_map:
     except Exception:
         pass
 
-# If you prefer, you can hardcode while testing:
-# MACHINE_MAP = {
-#     "-100111...": "Machine 1296 (R-1)",
-#     "-100222...": "Machine 1297 (R-2)",
-#     "-100333...": "Machine 1298 (R-3)",
-#     "-100444...": "Machine 1299 (R-4)",
-# }
-
-# Optional: set your Indian time (UTC+5:30) for stamps
+# Optional: set IST (UTC+5:30) for timestamps
 IST = timezone(timedelta(hours=5, minutes=30))
 
 # ===================== UTILITIES =====================
@@ -89,11 +82,11 @@ def fmt_machine(chat_id: int) -> str:
 def extract_metadata(text: str, fallback_machine: str) -> dict:
     """
     Parse optional metadata from the user's line:
-      ... ; operator=Name ; date=2025-11-09 ; machine=R-2
+      ... ; operator=Name ; date=2025-11-09 ; machine=R-2 ; batch=88
     Case-insensitive; separators can be ';' or newline.
-    If not present, auto-fill.
+    If not present, auto-fill date & machine.
     """
-    meta = {"operator": None, "date": None, "machine": None}
+    meta = {"operator": None, "date": None, "machine": None, "batch": None}
     pieces = re.split(r"[;\n]+", text)
     for p in pieces:
         kv = p.split("=", 1)
@@ -107,6 +100,8 @@ def extract_metadata(text: str, fallback_machine: str) -> dict:
             meta["date"] = v
         elif k in ("machine", "machine_no", "machine_name"):
             meta["machine"] = v
+        elif k in ("batch", "batch_no", "batchnum", "batchno"):
+            meta["batch"] = v
 
     if not meta["date"]:
         meta["date"] = datetime.now(IST).strftime("%Y-%m-%d")
@@ -118,6 +113,8 @@ def banner(title: str, meta: dict) -> str:
     parts = [f"**{title}**"]
     if meta.get("machine"):
         parts.append(f"• Machine: {meta['machine']}")
+    if meta.get("batch"):
+        parts.append(f"• Batch: {meta['batch']}")
     if meta.get("operator"):
         parts.append(f"• Operator: {meta['operator']}")
     if meta.get("date"):
@@ -244,9 +241,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Hi! I’m your Excel + AI assistant for pyrolysis.\n"
         f"Detected room → *{mlabel}*\n\n"
         "Use:\n"
-        "• `Feed: Nylon=2.0T, Radial=5.0T, Chips=3.5T, Powder=1.0T; operator=Rahul; date=2025-11-09`\n"
+        "• `Feed: Nylon=2.0T, Radial=5.0T, Chips=3.5T, Powder=1.0T; operator=Rahul; batch=88; date=2025-11-09`\n"
         "    → I’ll reply with *zone minutes* (here + summary).\n"
-        "• `Actual: 50-200=01:30:00, 200-300=01:10:00, 300-400=02:45:00` (meta optional)\n"
+        "• `Actual: 50-200=01:30:00, 200-300=01:10:00, 300-400=02:45:00; batch=88`\n"
         "    → I’ll compare to plan and give *what to change next time*.\n\n"
         "Commands: /plan, /actual, /reload, /help"
     )
@@ -259,7 +256,6 @@ async def plan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     mlabel = fmt_machine(chat_id)
     raw = update.message.text
-    # Support both "/plan ..." and plain "Feed: ..."
     payload = raw.replace("/plan", "Feed:").strip()
     meta = extract_metadata(payload, mlabel)
 
@@ -282,7 +278,7 @@ async def actual_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not deltas:
         await update.message.reply_text(
             "Couldn’t read your actuals.\nExample:\n"
-            "Actual: 50-200=01:10:00, 200-300=00:45:00, 300-400=01:20:00",
+            "Actual: 50-200=01:10:00, 200-300=00:45:00, 300-400=01:20:00; batch=88",
         )
         return
 
@@ -317,7 +313,7 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not deltas:
             await update.message.reply_text(
                 "Couldn’t read your actuals.\nExample:\n"
-                "Actual: 50-200=01:10:00, 200-300=00:45:00, 300-400=01:20:00"
+                "Actual: 50-200=01:10:00, 200-300=00:45:00, 300-400=01:20:00; batch=88"
             )
             return
         header = banner("Deviation vs plan (min)", meta)
