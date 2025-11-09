@@ -60,14 +60,14 @@ state = {
     "weights": { "radial": 0.045, "nylon": 0.035, "chips": 0.041, "powder": 0.028, "kachra": 0.03, "others": 0.03 },
 }
 
-def load_state():
+ load_state():
     try:
         if os.path.exists(STATE_FILE):
             state.update(json.load(open(STATE_FILE,"r",encoding="utf-8")))
     except Exception as e:
         log.warning("Could not load state.json: %s", e)
 
-def save_state():
+ save_state():
     try:
         json.dump(state, open(STATE_FILE,"w",encoding="utf-8"))
     except Exception as e:
@@ -76,10 +76,10 @@ def save_state():
 load_state()
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
-def norm_key(s: str) -> str:
+ norm_key(s: str) -> str:
     return s.strip().lower()
 
-def to_hhmmss(minutes: float|int|None) -> str:
+ to_hhmmss(minutes: float|int|None) -> str:
     if minutes is None or (isinstance(minutes,float) and math.isnan(minutes)):
         return "-"
     total = int(round(float(minutes)*60))
@@ -346,13 +346,9 @@ async def daily_summary_job(context: ContextTypes.DEFAULT_TYPE):
     if SUMMARY_CHAT_ID:
         await context.bot.send_message(SUMMARY_CHAT_ID, msg, parse_mode=ParseMode.MARKDOWN)
 
-def schedule_daily_summary(app: Application):
-    hh,mm = [int(x) for x in DAILY_SUMMARY_TIME.split(":")]
-    app.job_queue.run_daily(
-        daily_summary_job,
-        time=time(hour=hh, minute=mm, tzinfo=BOT_TZ),
-        name="daily_summary"
-    )
+def schedule_daily_summary(app):
+    print("⏰ Daily summary scheduling is disabled (JobQueue not available).")
+
 
 # ── Handlers ──────────────────────────────────────────────────────────────────
 HELP = (
@@ -578,3 +574,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
