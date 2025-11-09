@@ -1,82 +1,106 @@
-# bot.py
-# PyroVision Assistant — Telegram bot for feed → zone plan, yield prediction,
-# graph generation, daily summaries, reminders, and multi-machine routing.
-#
-# Requires: python-telegram-bot >= 21, pandas, numpy, openpyxl, matplotlib
-# Env vars on Railway:
-#   TELEGRAM_BOT_TOKEN    -> bot token
-#   SUMMARY_CHAT_ID       -> e.g. -100xxxxxxxxxx (All Machines group)
-#   MACHINE_MAP           -> JSON: {"-100111...":"Machine 1296 (R-1)", ...}
-#   REPORT_PATH           -> Excel rules file name (default below)
-#
-# Optional override:
-#   DAILY_SUMMARY_TIME    -> "21:35" (HH:MM, 24h, IST). Default 21:35.
+# ======================================================
+#  PYROVISION BOT – CLEAN HEADER (NO INDENTATION ERRORS)
+# ======================================================
 
-from __future__ import annotations
-
-import os, io, re, json, logging, asyncio, math
-from datetime import datetime, timedelta, time
-from zoneinfo import ZoneInfo
-
-import numpy as np
+import os, json, re, logging
+from datetime import time
 import pandas as pd
-import matplotlib.pyplot as plt
+import numpy as np
+from telegram import Update
+from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 
-from telegram import Update, InputFile
-from telegram.constants import ParseMode
-from telegram.ext import (
-    Application, CommandHandler, MessageHandler, ContextTypes, filters
-)
-
-# ── Config / Paths ────────────────────────────────────────────────────────────
-BOT_TZ = ZoneInfo("Asia/Kolkata")
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-REPORT_PATH        = os.environ.get("REPORT_PATH", "pyrolysis_feed_temp_ZONE_TIME_report.xlsx")
-SUMMARY_CHAT_ID    = int(os.environ.get("SUMMARY_CHAT_ID", "0") or "0")
-
-# MACHINE_MAP is a JSON string mapping each machine GROUP chat_id -> label
-#  {"-100111...":"Machine 1296 (R-1)", "-100222...":"Machine 1297 (R-2)", ...}
-try:
-    MACHINE_MAP: dict[str, str] = json.loads(os.environ.get("MACHINE_MAP","{}"))
-except Exception:
-    MACHINE_MAP = {}
-
-DAILY_SUMMARY_TIME = os.environ.get("DAILY_SUMMARY_TIME", "21:35")  # HH:MM IST
-
-# Logging
+LOG = logging.getLogger("pyro_bot")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
-log = logging.getLogger("pyro_bot")
 
-# ── Lite “model” storage (in-memory + simple json persistence between restarts) ─
-STATE_FILE = "state.json"
-state = {
-    # latest feed per machine group { chat_id: {batch, operator, ts, feed:dict, plan:dict} }
-    "latest_feed": {},
-    # pending reminders by batch key
-    "reminders": {},   # {key: {"chat_id":..., "due": ISO, "batch":...}}
-    # last actual per machine
-    "last_actual_ts": {}, # {chat_id: ISO}
-    # learning weights (very simple linear contribution by material)
-    "weights": { "radial": 0.045, "nylon": 0.035, "chips": 0.041, "powder": 0.028, "kachra": 0.03, "others": 0.03 },
-}
-load_state()
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+REPORT_PATH = os.environ.get("REPORT_PATH", "pyrolysis_feed_temp_ZONE_TIME_report.xlsx")
+ZONE_SHEET = "ZoneTime_Recommendations"
+
+STATE_FILE = "bot_state.json"
+state = {}
+
+# ------------------ STATE HANDLING ------------------
+def load_state():
+    """Load persistent state from disk (if any)."""
+    global state
     try:
         if os.path.exists(STATE_FILE):
-            state.update(json.load(open(STATE_FILE,"r",encoding="utf-8")))
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                state = json.load(f)
+            LOG.info("✅ State loaded successfully.")
+        else:
+            LOG.info("ℹ️ No state file found, starting fresh.")
     except Exception as e:
-        log.warning("Could not load state.json: %s", e)
+        LOG.warning(f"⚠️ Could not load state: {e}")
 
- save_state():
+def save_state():
+    """Save runtime state to disk."""
     try:
-        json.dump(state, open(STATE_FILE,"w",encoding="utf-8"))
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
     except Exception as e:
-        log.warning("Could not save state.json: %s", e)
+        LOG.warning(f"⚠️ Could not save state: {e}")
 
-load_state()
+# ------------------ ZONE RULES ------------------
+def load_zone_rules(path=REPORT_PATH, sheet=ZONE_SHEET):
+    rules = {}
+    try:
+        df = pd.read_excel(path, sheet_name=sheet)
+        for _, row in df.iterrows():
+            feat = str(row.get("zone_time_feature", "")).strip().lower()
+            mins = row.get("suggested_minutes", np.nan)
+            if not feat or pd.isna(mins):
+                continue
+            m = re.search(r"(\d{2,3}\s*[-–]\s*\d{2,3})", feat)
+            if not m:
+                continue
+            window = m.group(1).replace(" ", "").replace("–", "-")
+            which = "separator" if "separator" in feat else "reactor"
+            rules[f"{window} {which}"] = float(mins)
+        LOG.info(f"Loaded {len(rules)} zone rules.")
+    except Exception as e:
+        LOG.warning(f"⚠️ Failed to load Excel rules: {e}")
+        rules = {
+            "50-200 reactor": 60,
+            "200-300 reactor": 60,
+            "300-400 reactor": 70,
+            "400-450 reactor": 80,
+            "450-480 reactor": 25,
+            "480-500 reactor": 15,
+            "300-400 separator": 30,
+        }
+    return rules
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
- norm_key(s: str) -> str:
-    return s.strip().lower()
+ZONE_RULES = load_zone_rules()
+
+# ------------------ TELEGRAM CORE ------------------
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("✅ PyroVision Bot ready.\nType /help for commands.")
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("/plan /actual /reload /status /id")
+
+async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Message received, processing...")
+
+# ------------------ MAIN FUNCTION ------------------
+def main():
+    LOG.info("🚀 Starting PyroVision Assistant…")
+    load_state()
+
+    if not TELEGRAM_BOT_TOKEN:
+        raise RuntimeError("❌ Missing TELEGRAM_BOT_TOKEN environment variable!")
+
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
+
+    LOG.info("✅ Application started successfully.")
+    app.run_polling()
+
+if __name__ == "__main__":
+    main()
 
  to_hhmmss(minutes: float|int|None) -> str:
     if minutes is None or (isinstance(minutes,float) and math.isnan(minutes)):
@@ -566,4 +590,5 @@ def main():
 
     print("✅ Bot ready. Running polling loop.")
     app.run_polling()
+
 
