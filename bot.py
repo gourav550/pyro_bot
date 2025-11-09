@@ -1,437 +1,579 @@
 # bot.py
-# PyroVision Assistant: Excel-driven zone plan + oil% prediction + adaptive learning
-# Libraries: python-telegram-bot >= 21, pandas, numpy, openpyxl
+# PyroVision Assistant — Telegram bot for feed → zone plan, yield prediction,
+# graph generation, daily summaries, reminders, and multi-machine routing.
+#
+# Requires: python-telegram-bot >= 21, pandas, numpy, openpyxl, matplotlib
+# Env vars on Railway:
+#   TELEGRAM_BOT_TOKEN    -> bot token
+#   SUMMARY_CHAT_ID       -> e.g. -100xxxxxxxxxx (All Machines group)
+#   MACHINE_MAP           -> JSON: {"-100111...":"Machine 1296 (R-1)", ...}
+#   REPORT_PATH           -> Excel rules file name (default below)
+#
+# Optional override:
+#   DAILY_SUMMARY_TIME    -> "21:35" (HH:MM, 24h, IST). Default 21:35.
 
-import os
-import re
-import json
-import logging
-from pathlib import Path
-from datetime import datetime
-from typing import Dict, Tuple
+from __future__ import annotations
 
-import pandas as pd
+import os, io, re, json, logging, asyncio, math
+from datetime import datetime, timedelta, time
+from zoneinfo import ZoneInfo
+
 import numpy as np
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
+import pandas as pd
+import matplotlib.pyplot as plt
 
-# ========= ENV / CONFIG =========
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-REPORT_PATH        = os.environ.get("REPORT_PATH", "pyrolysis_feed_temp_ZONE_TIME_report.xlsx")
-ZONE_SHEET         = os.environ.get("ZONE_SHEET", "ZoneTime_Recommendations")
-SUMMARY_CHAT_ID    = os.environ.get("SUMMARY_CHAT_ID")  # e.g. "-1001234567890"
-MACHINE_MAP_JSON   = os.environ.get("MACHINE_MAP", "{}") # {"-1001":"Machine 1296 (R-1)","-1002":"Machine 1297 (R-2)",...}
-MODEL_STATE_PATH   = os.environ.get("MODEL_STATE_PATH", "model_state.json")
-
-# ========= LOGGING =========
-logger = logging.getLogger("pyro_bot")
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
-
-# ========= HELP =========
-HELP_TEXT = (
-    "Commands:\n"
-    "/plan <feed>        → Make a plan and predict oil.\n"
-    "/predict <feed>     → Predict oil % + confidence.\n"
-    "/actual <actuals>   → Compare vs plan; add oil=45 to let AI learn.\n"
-    "/reload             → Reload recommendations from Excel.\n\n"
-    "Feed format:\n"
-    "  Feed: Nylon=2.04T, Radial=4.80T, Chips=3.60T, Powder=0.575T, Kachra=0, Others=0\n"
-    "  Optional tags: batch=92, operator=Ravi\n\n"
-    "Actuals format:\n"
-    "  Actual: 50-200=01:21, 200-300=01:50, 300-400=02:55, 400-450=00:22; oil=45.0; batch=92\n\n"
-    "Tip: When you include oil=… in Actual, the model adapts and future predictions improve."
+from telegram import Update, InputFile
+from telegram.constants import ParseMode
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler, ContextTypes, filters
 )
 
-# ========= UTILS =========
-def normalize_zone_key(s: str) -> str:
-    """Map '50-200', '50-200 reactor', '50-200 separator' into canonical keys."""
-    s = s.strip().lower()
-    s = s.replace("°c", "").replace("c", "")
-    s = s.replace("temp", "").replace("zone", "")
-    s = s.replace("minutes", "").replace("mins", "").replace("min", "")
-    s = s.replace("reactor", " reactor").replace("separator", " separator")
-    s = re.sub(r"\s+", " ", s).strip()
-    if "separator" in s:
-        core = re.sub(r"[^0-9\-]", "", s.split("separator")[0]).strip()
-        return f"{core} separator"
-    if "reactor" in s:
-        core = re.sub(r"[^0-9\-]", "", s.split("reactor")[0]).strip()
-        return f"{core} reactor"
-    # default to reactor when unspecified
-    core = re.sub(r"[^0-9\-]", "", s)
-    return f"{core} reactor"
+# ── Config / Paths ────────────────────────────────────────────────────────────
+BOT_TZ = ZoneInfo("Asia/Kolkata")
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+REPORT_PATH        = os.environ.get("REPORT_PATH", "pyrolysis_feed_temp_ZONE_TIME_report.xlsx")
+SUMMARY_CHAT_ID    = int(os.environ.get("SUMMARY_CHAT_ID", "0") or "0")
 
-def to_hhmmss(minutes: float) -> str:
-    if minutes is None or (isinstance(minutes, float) and np.isnan(minutes)):
+# MACHINE_MAP is a JSON string mapping each machine GROUP chat_id -> label
+#  {"-100111...":"Machine 1296 (R-1)", "-100222...":"Machine 1297 (R-2)", ...}
+try:
+    MACHINE_MAP: dict[str, str] = json.loads(os.environ.get("MACHINE_MAP","{}"))
+except Exception:
+    MACHINE_MAP = {}
+
+DAILY_SUMMARY_TIME = os.environ.get("DAILY_SUMMARY_TIME", "21:35")  # HH:MM IST
+
+# Logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+log = logging.getLogger("pyro_bot")
+
+# ── Lite “model” storage (in-memory + simple json persistence between restarts) ─
+STATE_FILE = "state.json"
+state = {
+    # latest feed per machine group { chat_id: {batch, operator, ts, feed:dict, plan:dict} }
+    "latest_feed": {},
+    # pending reminders by batch key
+    "reminders": {},   # {key: {"chat_id":..., "due": ISO, "batch":...}}
+    # last actual per machine
+    "last_actual_ts": {}, # {chat_id: ISO}
+    # learning weights (very simple linear contribution by material)
+    "weights": { "radial": 0.045, "nylon": 0.035, "chips": 0.041, "powder": 0.028, "kachra": 0.03, "others": 0.03 },
+}
+
+def load_state():
+    try:
+        if os.path.exists(STATE_FILE):
+            state.update(json.load(open(STATE_FILE,"r",encoding="utf-8")))
+    except Exception as e:
+        log.warning("Could not load state.json: %s", e)
+
+def save_state():
+    try:
+        json.dump(state, open(STATE_FILE,"w",encoding="utf-8"))
+    except Exception as e:
+        log.warning("Could not save state.json: %s", e)
+
+load_state()
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+def norm_key(s: str) -> str:
+    return s.strip().lower()
+
+def to_hhmmss(minutes: float|int|None) -> str:
+    if minutes is None or (isinstance(minutes,float) and math.isnan(minutes)):
         return "-"
-    total = int(round(float(minutes) * 60))
-    h, m, s = total // 3600, (total % 3600) // 60, total % 60
+    total = int(round(float(minutes)*60))
+    h, rem = divmod(total, 3600)
+    m, s  = divmod(rem, 60)
     return f"{h:02d}:{m:02d}:{s:02d}"
 
 def hhmmss_to_minutes(s: str) -> float:
     s = s.strip()
-    if not s or s in ("0", "00:00", "00:00:00"):
-        return 0.0
-    parts = s.split(":")
-    if len(parts) == 3:
-        h, m, sec = map(float, parts)
-        return h * 60 + m + sec / 60.0
-    if len(parts) == 2:
-        m, sec = map(float, parts)
-        return m + sec / 60.0
-    return float(s)
+    if ":" not in s:
+        return float(s)
+    parts = list(map(int, s.split(":")))
+    if len(parts)==3:
+        h,m,sec = parts
+        return h*60 + m + sec/60
+    if len(parts)==2:
+        m,sec = parts
+        return m + sec/60
+    return 0.0
 
-def parse_keyvals(text: str) -> Dict[str, str]:
-    """Parse key=value pairs (batch=.., operator=.., oil=..)."""
-    out = {}
-    for kv in re.findall(r"(\b[a-zA-Z_]+)\s*=\s*([^,;]+)", text):
-        out[kv[0].strip().lower()] = kv[1].strip()
+def parse_feed(text: str) -> dict:
+    # Accept “Feed: Radial=5.1T, Nylon=0.6T, Chips=3.4T, Powder=1.5T, batch=92, operator=Ravi”
+    data = {}
+    t = re.sub(r"^/?(plan|predict)?\s*feed\s*:\s*|^feed\s*:\s*", "", text, flags=re.I).strip()
+    for part in re.split(r"[,\n;]+", t):
+        if not part.strip(): continue
+        if "=" in part:
+            k,v = [x.strip() for x in part.split("=",1)]
+        else:
+            # "Radial 5T" form
+            m = re.match(r"([A-Za-z]+)\s+([\d\.]+)", part.strip())
+            if not m: continue
+            k,v = m.group(1), m.group(2)
+        key = norm_key(k)
+        # handle units
+        v = v.replace("ton","T").replace("mt","T").replace("kg","K").replace("t","T")
+        if key in ("batch","operator","machine","date"):
+            data[key] = v
+            continue
+        # numeric
+        mT = re.match(r"([\d\.]+)\s*[tT]$", v)
+        mK = re.match(r"([\d\.]+)\s*[kK][gG]?$", v)
+        if mT:
+            val = float(mT.group(1))*1000.0
+        elif mK:
+            val = float(mK.group(1))
+        else:
+            val = float(re.sub(r"[^\d\.]","", v) or 0.0)
+            # assume kilograms if big, else tonnes? keep as kg
+        data[key] = val
+    # normalize keys
+    mapping = {
+        "radial":"radial","nylon":"nylon","chips":"chips","powder":"powder",
+        "kachra":"kachra","others":"others"
+    }
+    out = {mapping.get(k,k):v for k,v in data.items()}
     return out
 
-# ========= ENGINE: Excel → zone map =========
-class RecoEngine:
-    def __init__(self, report_path: str, sheet_name: str):
-        self.report_path = report_path
-        self.sheet_name = sheet_name
-        self.zone_map = {}
-        self._load_report()
+def parse_actual(text: str) -> dict:
+    # “Actual: 50-200=01:10, 200-300=00:45, 300-400=01:20, 400-450=00:22; oil=46.2; batch=88”
+    t = re.sub(r"^/?actual\s*:?","", text, flags=re.I).strip()
+    out = {}
+    for chunk in re.split(r"[;,]+", t):
+        if "=" not in chunk: continue
+        k,v = [x.strip() for x in chunk.split("=",1)]
+        lk = norm_key(k)
+        if lk=="oil" or lk=="oil%":
+            out["oil"] = float(re.sub(r"[^\d\.]","", v) or 0.0)
+        elif re.match(r"\d{2,3}\s*-\s*\d{2,3}", lk):
+            # zone
+            out[lk.replace(" ","")] = hhmmss_to_minutes(v)
+        elif lk=="batch":
+            out["batch"] = v
+    return out
 
-    def _load_report(self):
-        self.zone_map.clear()
+# ── Recommendation Engine (Excel-driven + simple heuristics) ──────────────────
+class RecoEngine:
+    def __init__(self, report_path: str):
+        self.report_path = report_path
+        self.zone_defaults: dict[str,float] = {}   # "50-200 reactor" etc.
+        self._load()
+
+    def _load(self):
+        self.zone_defaults.clear()
         try:
-            df = pd.read_excel(self.report_path, sheet_name=self.sheet_name)
-            # expect columns: zone_time_feature, suggested_minutes
-            for _, row in df.iterrows():
-                feat = str(row.get("zone_time_feature", "")).strip()
-                sug  = row.get("suggested_minutes", np.nan)
-                if not feat:
-                    continue
-                low = feat.lower()
-                m = re.search(r"(\d{2,3}\s*[-–]\s*\d{2,3})", low)
-                if not m:
-                    continue
-                window = m.group(1).replace(" ", "").replace("–", "-")
-                key = f"{window} {'separator' if 'separator' in low else 'reactor'}"
-                self.zone_map[key] = float(sug) if pd.notna(sug) else np.nan
-            logger.info("Loaded %d zone rules from %s", len(self.zone_map), self.report_path)
+            df = pd.read_excel(self.report_path, sheet_name="ZoneTime_Recommendations")
+            for _, r in df.iterrows():
+                feat = str(r.get("zone_time_feature","")).lower()
+                mins = r.get("suggested_minutes", np.nan)
+                if not feat or pd.isna(mins): continue
+                m = re.search(r"(\d{2,3}\s*[-–]\s*\d{2,3})", feat)
+                if not m: continue
+                window = m.group(1).replace(" ","").replace("–","-")
+                which = "separator" if "separator" in feat else "reactor"
+                self.zone_defaults[f"{window} {which}"] = float(mins)
+            log.info("Loaded %d zone rules from %s", len(self.zone_defaults), self.report_path)
         except Exception as e:
-            logger.exception("Failed to load Excel; using safe defaults")
-            self.zone_map.update({
-                "50-200 reactor": 60.0, "200-300 reactor": 60.0,
-                "300-400 reactor": 70.0, "400-450 reactor": 40.0,
-                "480-500 reactor": 12.0, "500-520 reactor": 10.0,
-                "300-400 separator": 30.0,
+            log.warning("Excel load failed (%s). Falling back to conservative defaults.", e)
+            self.zone_defaults.update({
+                "50-200 reactor": 60, "200-300 reactor": 60, "300-400 reactor": 75,
+                "400-450 reactor": 70, "450-480 reactor": 25, "480-500 reactor": 15,
+                "300-400 separator": 30
             })
 
-    def plan_from_feed(self, feed_text: str) -> Dict[str, float]:
-        _ = self._parse_feed(feed_text)  # future: make plan depend on feed
-        return dict(self.zone_map)
+    def plan(self, feed: dict) -> dict[str,float]:
+        # base plan from defaults
+        plan = dict(self.zone_defaults)
+        # very light adjustment from composition (more radial/chips → extend 300–400)
+        total = sum(feed.get(k,0.0) for k in ("radial","nylon","chips","powder","kachra","others"))
+        if total > 0:
+            radial_ratio = feed.get("radial",0.0)/total
+            chips_ratio  = feed.get("chips",0.0)/total
+            nylon_ratio  = feed.get("nylon",0.0)/total
+            # ±15% window on key zones
+            adj = 1.0 + 0.15*(radial_ratio + 0.5*chips_ratio - 0.6*nylon_ratio)
+            for k in list(plan.keys()):
+                if k.startswith("300-400"):
+                    plan[k] = max(20, plan[k]*adj)
+                if k.startswith("200-300"):
+                    plan[k] = max(15, plan[k]*(1.0 + 0.1*radial_ratio - 0.05*nylon_ratio))
+        return plan
 
-    def compare_actuals(self, actual_text: str, plan_minutes: Dict[str, float]) -> Tuple[Dict[str, float], list]:
-        actual_map = self._parse_actuals(actual_text)
-        tips, deltas = [], {}
-        for k, target_min in plan_minutes.items():
-            if k not in actual_map or (isinstance(target_min, float) and np.isnan(target_min)):
-                continue
-            a = actual_map[k]
-            deltas[k] = a - target_min
-            if abs(deltas[k]) >= 5:
-                tips.append(("reduce" if deltas[k] > 0 else "increase") + f" {k} by ~{abs(deltas[k]):.0f} min")
-        if not tips:
-            tips = ["Near-optimal execution vs plan. Keep the same profile."]
-        return deltas, tips
+engine = RecoEngine(REPORT_PATH)
 
-    def _parse_feed(self, text: str) -> Dict[str, float]:
-        # returns kg map
-        text = text.replace("Feed:", "").strip()
-        parts = re.split(r"[,\n]+", text)
-        out = {}
-        for p in parts:
-            m = re.search(r"([A-Za-z\s/()]+)\s*=\s*([0-9.]+)\s*([Tt]|[Kk][Gg])?", p.strip())
-            if m:
-                name = m.group(1).strip().lower()
-                val = float(m.group(2))
-                unit = (m.group(3) or "").lower()
-                if unit == "t":
-                    val *= 1000.0
-                out[name] = val
-        return out
+# ── Yield prediction (very simple, learns from /actual) ───────────────────────
+def predict_yield(feed: dict) -> tuple[float,float]:
+    """Return (predicted_oil_percent, confidence 0..1)."""
+    total = sum(feed.get(k,0.0) for k in ("radial","nylon","chips","powder","kachra","others"))
+    if total <= 0: return (0.0, 0.2)
+    w = state["weights"]
+    # weighted kg → % (divide by total kg)
+    base = 0.0
+    for k,kg in feed.items():
+        if k in w:
+            base += (kg/total) * (w[k]*100.0)  # convert to %
+    # clamp reasonable range
+    pred = max(30.0, min(55.0, base))
+    # confidence grows with how similar this mix is to what we’ve seen
+    # (proxy: more total kg + not too extreme ratios)
+    ratio_spread = np.std([feed.get(x,0.0)/total for x in ("radial","nylon","chips","powder")])
+    conf = max(0.55, min(0.95, 0.95 - 0.8*ratio_spread))
+    return (round(pred,2), round(conf,2))
 
-    def _parse_actuals(self, text: str) -> Dict[str, float]:
-        text = text.replace("Actual:", "").strip()
-        out = {}
-        for p in re.split(r"[,\n;]+", text):
-            if "=" not in p:
-                continue
-            left, right = p.split("=", 1)
-            key = normalize_zone_key(left)
-            val = right.strip()
-            try:
-                minutes = hhmmss_to_minutes(val) if ":" in val else float(val)
-                out[key] = minutes
-            except Exception:
-                continue
-        return out
+def learn_from_actual(feed: dict, actual_oil: float):
+    """Tiny learning step: move weights toward explaining the actual."""
+    total = sum(feed.get(k,0.0) for k in ("radial","nylon","chips","powder","kachra","others"))
+    if total <= 0: return
+    pred,_ = predict_yield(feed)
+    err = (actual_oil - pred)/100.0
+    # nudge weights in the direction of error, proportional to share
+    for k in ("radial","nylon","chips","powder","kachra","others"):
+        share = feed.get(k,0.0)/total
+        state["weights"][k] += 0.01 * err * share   # small learning rate
+    save_state()
 
-engine = RecoEngine(REPORT_PATH, ZONE_SHEET)
-
-# ========= LIGHT OIL% MODEL (linear + online learning) =========
-FEATURE_NAMES = [
-    "bias",
-    "f_nylon", "f_radial", "f_chips", "f_powder", "f_others",
-    "z_50_200", "z_200_300", "z_300_400", "z_400_450",
-]
-
-def _empty_state():
-    return {
-        "weights": {
-            "bias": 44.0,
-            "f_nylon":   -2.0,
-            "f_radial":   2.0,
-            "f_chips":    1.0,
-            "f_powder":  -1.0,
-            "f_others":   0.0,
-            "z_50_200":   0.10,
-            "z_200_300":  0.05,
-            "z_300_400":  0.08,
-            "z_400_450":  0.04,
-        },
-        "rmse": 4.0,
-        "seen": 0
-    }
-
-def _load_state():
-    p = Path(MODEL_STATE_PATH)
-    if p.exists():
-        try:
-            return json.loads(p.read_text())
-        except Exception:
-            pass
-    return _empty_state()
-
-def _save_state(state):
-    Path(MODEL_STATE_PATH).write_text(json.dumps(state))
-
-MODEL = _load_state()
-
-def _extract_feed_fractions(feed_map: Dict[str, float]) -> Dict[str, float]:
-    keys = ["nylon","radial","chips","powder","others","kachra"]
-    total = sum(feed_map.get(k, 0.0) for k in keys)
-    if total <= 0:
-        return dict(f_nylon=0,f_radial=0,f_chips=0,f_powder=0,f_others=0)
-    return dict(
-        f_nylon  = feed_map.get("nylon",0.0)/total,
-        f_radial = feed_map.get("radial",0.0)/total,
-        f_chips  = feed_map.get("chips",0.0)/total,
-        f_powder = feed_map.get("powder",0.0)/total,
-        f_others = (feed_map.get("others",0.0)+feed_map.get("kachra",0.0))/total,
-    )
-
-def _predict_oil_pct(feed_map: Dict[str,float], minutes: Dict[str,float]|None) -> Tuple[float,float]:
-    w = MODEL["weights"]
-    f = _extract_feed_fractions(feed_map)
-    z = dict(z_50_200=0,z_200_300=0,z_300_400=0,z_400_450=0)
-    if minutes:
-        z["z_50_200"]  = float(minutes.get("50-200 reactor", 0))
-        z["z_200_300"] = float(minutes.get("200-300 reactor", 0))
-        z["z_300_400"] = float(minutes.get("300-400 reactor", 0))
-        z["z_400_450"] = float(minutes.get("400-450 reactor", 0))
-    y = (w["bias"] + w["f_nylon"]*f["f_nylon"] + w["f_radial"]*f["f_radial"]
-         + w["f_chips"]*f["f_chips"] + w["f_powder"]*f["f_powder"] + w["f_others"]*f["f_others"]
-         + w["z_50_200"]*z["z_50_200"] + w["z_200_300"]*z["z_200_300"]
-         + w["z_300_400"]*z["z_300_400"] + w["z_400_450"]*z["z_400_450"])
-    y = max(30.0, min(55.0, y))
-    rmse = max(1e-6, float(MODEL.get("rmse", 4.0)))
-    conf = max(0.1, min(0.95, 1.0/(1.0 + rmse/3.0)))
-    return (round(y,2), round(conf,2))
-
-def _sgd_update(feed_map: Dict[str,float], actual_minutes: Dict[str,float]|None, oil_pct: float):
-    alpha = 0.003
-    w = MODEL["weights"]
-    f = _extract_feed_fractions(feed_map)
-    z = dict(z_50_200=0,z_200_300=0,z_300_400=0,z_400_450=0)
-    if actual_minutes:
-        z["z_50_200"]  = float(actual_minutes.get("50-200 reactor", 0))
-        z["z_200_300"] = float(actual_minutes.get("200-300 reactor", 0))
-        z["z_300_400"] = float(actual_minutes.get("300-400 reactor", 0))
-        z["z_400_450"] = float(actual_minutes.get("400-450 reactor", 0))
-    y_hat, _ = _predict_oil_pct(feed_map, actual_minutes)
-    err = (oil_pct - y_hat)
-
-    w["bias"]        += alpha * err
-    w["f_nylon"]     += alpha * err * f["f_nylon"]
-    w["f_radial"]    += alpha * err * f["f_radial"]
-    w["f_chips"]     += alpha * err * f["f_chips"]
-    w["f_powder"]    += alpha * err * f["f_powder"]
-    w["f_others"]    += alpha * err * f["f_others"]
-    w["z_50_200"]    += alpha * err * z["z_50_200"]
-    w["z_200_300"]   += alpha * err * z["z_200_300"]
-    w["z_300_400"]   += alpha * err * z["z_300_400"]
-    w["z_400_450"]   += alpha * err * z["z_400_450"]
-
-    n = int(MODEL.get("seen",0)) + 1
-    old_rmse = MODEL.get("rmse", 4.0)
-    new_rmse = ((old_rmse**2 * (n-1) + err**2)/n) ** 0.5
-    MODEL["rmse"], MODEL["seen"] = float(new_rmse), n
-    _save_state(MODEL)
-
-# ========= GROUP / CONTEXT =========
-try:
-    MACHINE_MAP: Dict[str, str] = json.loads(MACHINE_MAP_JSON)
-except Exception:
-    MACHINE_MAP = {}
-
-def machine_label(chat_id: int) -> str:
-    return MACHINE_MAP.get(str(chat_id), f"Chat {chat_id}")
-
-def header_line(chat_id: int, extra: Dict[str,str]) -> str:
-    lab = machine_label(chat_id)
-    bt  = extra.get("batch")
-    op  = extra.get("operator")
-    stamp = datetime.now().strftime("%d-%b %H:%M")
-    parts = [f"🧪 *{lab}* · {stamp}"]
-    if bt: parts.append(f"Batch {bt}")
-    if op: parts.append(f"Operator {op}")
-    return " | ".join(parts)
-
-async def send_to_summary(context: ContextTypes.DEFAULT_TYPE, text: str):
-    if SUMMARY_CHAT_ID:
-        try:
-            await context.bot.send_message(chat_id=int(SUMMARY_CHAT_ID), text=text, parse_mode="Markdown", disable_web_page_preview=True)
-        except Exception as e:
-            logger.warning("Summary send failed: %s", e)
-
-# ========= PLAN / PREDICT / ACTUAL HANDLERS =========
-latest_plan_cache: Dict[int, Dict[str,float]] = {}
-latest_feed_cache: Dict[int, Dict[str,float]] = {}
-
-def format_plan(plan: Dict[str,float]) -> str:
-    def key_order(k):
-        m = re.match(r"(\d{2,3})-(\d{2,3})", k)
-        a = int(m.group(1)) if m else 0
-        b = int(m.group(2)) if m else 0
-        return (a, b, ("separator" in k))
+# ── Rendering helpers ─────────────────────────────────────────────────────────
+def pretty_plan(plan: dict[str,float]) -> str:
+    def k(x):
+        m = re.match(r"(\d{2,3})-(\d{2,3})", x)
+        if not m: return (999,999,x)
+        return (int(m.group(1)), int(m.group(2)), x)
     lines = []
-    for z in sorted(plan.keys(), key=key_order):
+    for z in sorted(plan.keys(), key=k):
         lines.append(f"{z}: {to_hhmmss(plan[z])}")
     return "\n".join(lines)
 
-async def start_cmd(update: Update, _: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("PyroVision Assistant ready ✅\n\n"+HELP_TEXT)
+def route_summary(context: ContextTypes.DEFAULT_TYPE, text: str):
+    if SUMMARY_CHAT_ID:
+        asyncio.create_task(context.bot.send_message(SUMMARY_CHAT_ID, text))
 
-async def help_cmd(update: Update, _: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(HELP_TEXT)
+def machine_label(chat_id: int) -> str:
+    return MACHINE_MAP.get(str(chat_id)) or MACHINE_MAP.get(str(int(chat_id))) or f"{chat_id}"
 
-async def reload_cmd(update: Update, _: ContextTypes.DEFAULT_TYPE):
-    engine._load_report()
-    await update.message.reply_text("Reloaded recommendations from Excel ✅")
+# ── Graph generation ──────────────────────────────────────────────────────────
+def chart_from_csv(df: pd.DataFrame) -> io.BytesIO:
+    # Expect columns: ts (ISO or time), Tr, Ts, Pr, Ps (any subset ok)
+    fig, ax1 = plt.subplots(figsize=(12,4), dpi=160)
+    t = pd.to_datetime(df.get("ts") or df.index)
+    if "Tr" in df: ax1.plot(t, df["Tr"], label="Temperature (Tr)")
+    if "Ts" in df: ax1.plot(t, df["Ts"], label="Temperature (Ts)")
+    ax1.set_ylabel("°C")
+    ax2 = ax1.twinx()
+    if "Pr" in df: ax2.plot(t, df["Pr"], linestyle="--", label="Pressure (Pr)", alpha=0.6)
+    if "Ps" in df: ax2.plot(t, df["Ps"], linestyle="--", label="Pressure (Ps)", alpha=0.6)
+    ax2.set_ylabel("Bar")
+    ax1.set_xlabel("Time")
+    lines, labels = [], []
+    for ax in (ax1, ax2):
+        l = ax.get_lines()
+        lines += l
+        labels += [ln.get_label() for ln in l]
+    ax1.legend(lines, labels, loc="upper left")
+    ax1.grid(True, alpha=0.2)
+    buf = io.BytesIO()
+    plt.tight_layout()
+    plt.savefig(buf, format="png")
+    plt.close(fig)
+    buf.seek(0)
+    return buf
+
+def chart_from_plan_vs_actual(plan: dict[str,float], actual: dict[str,float]|None=None) -> io.BytesIO:
+    zones = []
+    for z in sorted(plan.keys(), key=lambda s: int(s.split("-")[0])):
+        zones.append(z)
+    pmins = [plan[z] for z in zones]
+    amins = [actual.get(z, np.nan) if actual else np.nan for z in zones]
+    x = np.arange(len(zones))
+    width = 0.38
+    fig, ax = plt.subplots(figsize=(10,3), dpi=160)
+    ax.bar(x - width/2, pmins, width, label="Plan (min)")
+    if actual:
+        ax.bar(x + width/2, amins, width, label="Actual (min)")
+    ax.set_xticks(x, zones, rotation=25)
+    ax.set_ylabel("Minutes")
+    ax.legend()
+    ax.grid(True, axis="y", alpha=0.2)
+    buf = io.BytesIO()
+    plt.tight_layout()
+    plt.savefig(buf, format="png")
+    plt.close(fig)
+    buf.seek(0)
+    return buf
+
+# ── Job helpers (reminders & daily summary) ───────────────────────────────────
+def batch_key(chat_id: int, batch: str|int|None) -> str:
+    return f"{chat_id}:{batch or ''}"
+
+async def reminder_job(context: ContextTypes.DEFAULT_TYPE):
+    data = context.job.data or {}
+    chat_id = data.get("chat_id")
+    batch   = data.get("batch")
+    key = batch_key(chat_id, batch)
+    # If still pending, ping machine + summary
+    if key in state["reminders"]:
+        txt = (f"⚠️ *Reminder:* Actual data not entered yet for *Batch {batch}* "
+               f"on *{machine_label(chat_id)}*. Please send `/actual …`.")
+        await context.bot.send_message(chat_id, txt, parse_mode=ParseMode.MARKDOWN)
+        route_summary(context, f"🔔 {txt}")
+        # keep it (operator may enter later); or remove after one reminder:
+        # del state["reminders"][key]; save_state()
+
+async def daily_summary_job(context: ContextTypes.DEFAULT_TYPE):
+    now = datetime.now(BOT_TZ)
+    lines = [f"📊 *Daily Summary* — {now.strftime('%d-%b %H:%M')} (IST)"]
+    for cid_str,label in MACHINE_MAP.items():
+        cid = int(cid_str)
+        lf = state["latest_feed"].get(cid_str)
+        status = "Idle"
+        if lf:
+            last_feed_ts = datetime.fromisoformat(lf["ts"])
+            hrs = (now - last_feed_ts.astimezone(BOT_TZ)).total_seconds()/3600
+            # Completed if >11h since feed or last actual is after feed
+            last_act_iso = state["last_actual_ts"].get(cid_str)
+            completed = False
+            if last_act_iso:
+                last_act_ts = datetime.fromisoformat(last_act_iso)
+                completed = last_act_ts >= last_feed_ts
+            if hrs <= 11 and not completed:
+                status = f"Running (batch {lf.get('batch','?')})"
+            elif completed or hrs > 11:
+                status = f"Completed (batch {lf.get('batch','?')})"
+        lines.append(f"• {label}: {status}")
+    msg = "\n".join(lines)
+    if SUMMARY_CHAT_ID:
+        await context.bot.send_message(SUMMARY_CHAT_ID, msg, parse_mode=ParseMode.MARKDOWN)
+
+def schedule_daily_summary(app: Application):
+    hh,mm = [int(x) for x in DAILY_SUMMARY_TIME.split(":")]
+    app.job_queue.run_daily(
+        daily_summary_job,
+        time=time(hour=hh, minute=mm, tzinfo=BOT_TZ),
+        name="daily_summary"
+    )
+
+# ── Handlers ──────────────────────────────────────────────────────────────────
+HELP = (
+    "*Commands*\n"
+    "• `Feed: Radial=5.1T, Nylon=0.6T, Chips=3.4T, Powder=1.5T, batch=92, operator=Ravi` → Plan + Predicted Oil\n"
+    "• `/whatif Feed: …` → Predicted Oil + Confidence (no plan)\n"
+    "• `/actual Actual: 50-200=1:10, 200-300=0:45, 300-400=1:20, 400-450=0:22; oil=46.2; batch=92` → Compare & Learn\n"
+    "• `/chart` with CSV (ts,Tr,Ts,Pr,Ps) attached → Temperature/Pressure chart\n"
+    "• `/chart planned` (or after /actual) → Plan vs Actual bar chart image\n"
+    "• `/status` → Shows status of all machines (in Summary group) or current machine\n"
+    "• `/reload` → Reload Excel rules\n"
+)
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("PyroVision Assistant ready ✅\n\n" + HELP, parse_mode=ParseMode.MARKDOWN)
+
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(HELP, parse_mode=ParseMode.MARKDOWN)
+
+async def reload_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    engine._load()
+    await update.message.reply_text("🔁 Reloaded recommendations from Excel.")
+    route_summary(context, f"🔁 Rules reloaded by {machine_label(update.effective_chat.id)}")
+
+def remember_feed(chat_id: int, feed: dict, plan: dict):
+    now = datetime.now(BOT_TZ)
+    entry = {
+        "ts": now.isoformat(),
+        "batch": str(feed.get("batch","")),
+        "operator": str(feed.get("operator","")),
+        "feed": feed, "plan": plan
+    }
+    state["latest_feed"][str(chat_id)] = entry
+    # schedule reminder if batch present
+    batch = entry["batch"]
+    if batch:
+        key = batch_key(chat_id, batch)
+        state["reminders"][key] = {"chat_id": chat_id, "batch": batch, "due": (now+timedelta(hours=12)).isoformat()}
+    save_state()
+
+async def plan_cmd_core(update: Update, context: ContextTypes.DEFAULT_TYPE, feed_text: str, predict_only=False):
+    chat_id = update.effective_chat.id
+    feed = parse_feed(feed_text)
+    plan = engine.plan(feed)
+    pred, conf = predict_yield(feed)
+    label = machine_label(chat_id)
+    batch = feed.get("batch","?")
+    oper  = feed.get("operator","?")
+    # Remember feed (and set reminder)
+    remember_feed(chat_id, feed, plan)
+
+    msg = []
+    msg.append(f"🏷️ *{label}* — *Batch* {batch}, *Operator* {oper}")
+    msg.append(f"🛢️ Feed: Radial {feed.get('radial',0)/1000:.2f}T, Nylon {feed.get('nylon',0)/1000:.2f}T, Chips {feed.get('chips',0)/1000:.2f}T, Powder {feed.get('powder',0)/1000:.2f}T")
+    msg.append(f"📈 Predicted Oil: *{pred:.2f}%*  (confidence {conf:.2f})")
+    if not predict_only:
+        msg.append("\n*Recommended zone minutes (plan):*\n" + pretty_plan(plan))
+    text = "\n".join(msg)
+    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+    route_summary(context, text)
 
 async def plan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-    feed_text = text.replace("/plan", "Feed:").strip()
-    plan = engine.plan_from_feed(feed_text)
-    feed_map = engine._parse_feed(feed_text)
-    latest_plan_cache[update.effective_chat.id] = plan
-    latest_feed_cache[update.effective_chat.id] = feed_map
+    await plan_cmd_core(update, context, update.message.text, predict_only=False)
 
-    pred, conf = _predict_oil_pct(feed_map, plan)
-
-    meta = parse_keyvals(text)
-    hdr = header_line(update.effective_chat.id, meta)
-    msg = (f"{hdr}\n\n*Recommended zone minutes (from data):*\n"
-           f"{format_plan(plan)}\n\n"
-           f"*Predicted oil:* {pred:.2f}%  _(confidence {conf:.2f})_")
-    await update.message.reply_text(msg, parse_mode="Markdown", disable_web_page_preview=True)
-
-    # also send to summary
-    await send_to_summary(context, f"From {machine_label(update.effective_chat.id)}:\n\n{msg}")
-
-async def predict_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-    feed_text = text.replace("/predict", "Feed:").strip()
-    plan = engine.plan_from_feed(feed_text)
-    feed_map = engine._parse_feed(feed_text)
-    pred, conf = _predict_oil_pct(feed_map, plan)
-
-    meta = parse_keyvals(text)
-    hdr = header_line(update.effective_chat.id, meta)
-    msg = (f"{hdr}\n\n*Predicted oil:* {pred:.2f}%  _(confidence {conf:.2f})_\n\n"
-           f"*Plan used (from data):*\n{format_plan(plan)}")
-    await update.message.reply_text(msg, parse_mode="Markdown", disable_web_page_preview=True)
+async def whatif_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    t = re.sub(r"^/?whatif\s*","", update.message.text, flags=re.I)
+    await plan_cmd_core(update, context, t, predict_only=True)
 
 async def actual_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-    actual_text = text.replace("/actual", "Actual:").strip()
-    plan = latest_plan_cache.get(update.effective_chat.id, engine.plan_from_feed("Feed:"))
-    deltas, tips = engine.compare_actuals(actual_text, plan)
+    chat_id = update.effective_chat.id
+    actual = parse_actual(update.message.text)
+    # get last plan for this machine
+    lf = state["latest_feed"].get(str(chat_id))
+    if not lf:
+        await update.message.reply_text("I don't find a recorded Feed for this machine. Send the Feed first.")
+        return
+    plan = lf.get("plan", {})
+    deltas = {}
+    tips = []
+    for z,pmin in plan.items():
+        zkey = z.replace(" ","")
+        if zkey in actual:
+            am = actual[zkey]
+            deltas[z] = am - pmin
+            if abs(deltas[z]) >= 5:
+                tips.append(("reduce" if deltas[z]>0 else "increase", z, abs(deltas[z])))
+    # learning if oil provided
+    if "oil" in actual:
+        learn_from_actual(lf.get("feed",{}), float(actual["oil"]))
+        state["last_actual_ts"][str(chat_id)] = datetime.now(BOT_TZ).isoformat()
+        # clear reminder if any
+        key = batch_key(chat_id, lf.get("batch"))
+        if key in state["reminders"]:
+            del state["reminders"][key]
+        save_state()
 
-    # Learn if oil= provided
-    oil_pct = None
-    m = re.search(r"oil\s*=\s*([0-9]+(?:\.[0-9]+)?)\s*%?", text, flags=re.I)
-    if m:
-        oil_pct = float(m.group(1))
-        feed_map = latest_feed_cache.get(update.effective_chat.id, engine._parse_feed("Feed:"))
-        _sgd_update(feed_map, engine._parse_actuals(actual_text), oil_pct)
-
-    meta = parse_keyvals(text)
-    hdr = header_line(update.effective_chat.id, meta)
-
-    lines = [f"{hdr}", "*Deviation vs plan (min):*"]
-    if not deltas:
-        lines.append("Couldn’t read your actuals.\nExample:\nActual: 50-200=01:10:00, 200-300=00:45:00, 300-400=01:20:00, 400-450=01:00:00")
+    # reply
+    lines = [f"📊 Deviation vs plan (min):"]
+    for z in sorted(deltas.keys(), key=lambda s: int(s.split("-")[0])):
+        lines.append(f"{z}: {deltas[z]:+.0f}")
+    if tips:
+        lines.append("\n🛠️ Recommendations:")
+        for d,z,mins in tips:
+            lines.append(f"• {d} {z} by ~{mins:.0f} min")
     else:
-        for k in sorted(deltas.keys()):
-            lines.append(f"{k}: {deltas[k]:+.0f}")
-        lines.append("\n*Recommendations:*")
-        for t in tips:
-            lines.append(f"• {t}")
-    if oil_pct is not None:
-        lines.append(f"\nThanks! Learned from oil={oil_pct:.2f}%.")
-    msg = "\n".join(lines)
+        lines.append("\n✅ Near-optimal execution vs plan.")
+    await update.message.reply_text("\n".join(lines))
 
-    await update.message.reply_text(msg, parse_mode="Markdown", disable_web_page_preview=True)
-    await send_to_summary(context, f"From {machine_label(update.effective_chat.id)}:\n\n{msg}")
+    # also send plan vs actual bar chart
+    buf = chart_from_plan_vs_actual(plan, {k.replace(" ",""):v for k,v in actual.items() if "-" in k})
+    await context.bot.send_photo(chat_id, photo=InputFile(buf, filename="plan_vs_actual.png"))
+    route_summary(context, f"🧾 Actual logged for {machine_label(chat_id)} (batch {lf.get('batch','?')}).")
+
+async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    now = datetime.now(BOT_TZ)
+    # if in summary group → show all. otherwise show current machine
+    if SUMMARY_CHAT_ID and update.effective_chat.id == SUMMARY_CHAT_ID:
+        lines = ["🟢 *Machine Status*"]
+        for cid_str,label in MACHINE_MAP.items():
+            lf = state["latest_feed"].get(cid_str)
+            st = "Idle"
+            if lf:
+                last_feed_ts = datetime.fromisoformat(lf["ts"])
+                hrs = (now - last_feed_ts.astimezone(BOT_TZ)).total_seconds()/3600
+                last_act_iso = state["last_actual_ts"].get(cid_str)
+                completed = False
+                if last_act_iso:
+                    completed = datetime.fromisoformat(last_act_iso) >= last_feed_ts
+                if hrs <= 11 and not completed:
+                    st = f"Running (batch {lf.get('batch','?')})"
+                elif completed:
+                    st = f"Completed (batch {lf.get('batch','?')})"
+                elif hrs > 12:
+                    st = f"Overdue (no actual)"
+                else:
+                    st = "Idle"
+            lines.append(f"• {label}: {st}")
+        await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+    else:
+        cid = str(update.effective_chat.id)
+        label = machine_label(update.effective_chat.id)
+        lf = state["latest_feed"].get(cid)
+        st = "Idle"
+        if lf:
+            last_feed_ts = datetime.fromisoformat(lf["ts"])
+            hrs = (now - last_feed_ts.astimezone(BOT_TZ)).total_seconds()/3600
+            last_act_iso = state["last_actual_ts"].get(cid)
+            completed = last_act_iso and (datetime.fromisoformat(last_act_iso) >= last_feed_ts)
+            if hrs <= 11 and not completed:
+                st = f"Running (batch {lf.get('batch','?')})"
+            elif completed:
+                st = f"Completed (batch {lf.get('batch','?')})"
+            elif hrs > 12:
+                st = "Overdue (no actual)"
+        await update.message.reply_text(f"{label}: {st}")
+
+async def chart_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # If CSV attached → temp/pressure chart; else, plan vs actual bar chart for last batch
+    doc = update.message.document
+    if doc and (doc.file_name.lower().endswith(".csv")):
+        f = await doc.get_file()
+        bio = io.BytesIO()
+        await f.download_to_memory(out=bio)
+        bio.seek(0)
+        df = pd.read_csv(bio)
+        buf = chart_from_csv(df)
+        await context.bot.send_photo(update.effective_chat.id, InputFile(buf, filename="tp_chart.png"))
+        return
+    # no CSV → show last plan (and actual if exists)
+    lf = state["latest_feed"].get(str(update.effective_chat.id))
+    if not lf:
+        await update.message.reply_text("No recent plan to chart. Send a Feed first, or attach a CSV log.")
+        return
+    plan = lf.get("plan",{})
+    # try to find last actual deltas (not stored); render plan only
+    buf = chart_from_plan_vs_actual(plan, None)
+    await context.bot.send_photo(update.effective_chat.id, InputFile(buf, filename="plan_chart.png"))
 
 async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
-    low = text.lower()
-    if low.startswith("feed:"):
-        # treat as /plan
-        plan = engine.plan_from_feed(text)
-        feed_map = engine._parse_feed(text)
-        latest_plan_cache[update.effective_chat.id] = plan
-        latest_feed_cache[update.effective_chat.id] = feed_map
-
-        pred, conf = _predict_oil_pct(feed_map, plan)
-        meta = parse_keyvals(text)
-        hdr = header_line(update.effective_chat.id, meta)
-        msg = (f"{hdr}\n\n*Recommended zone minutes (from data):*\n"
-               f"{format_plan(plan)}\n\n"
-               f"*Predicted oil:* {pred:.2f}%  _(confidence {conf:.2f})_")
-        await update.message.reply_text(msg, parse_mode="Markdown", disable_web_page_preview=True)
-        await send_to_summary(context, f"From {machine_label(update.effective_chat.id)}:\n\n{msg}")
-
-    elif low.startswith("actual:"):
+    if re.match(r"(?i)^feed\s*:", text):
+        await plan_cmd_core(update, context, text, predict_only=False)
+        # schedule reminder job in 12h (if batch present)
+        lf = state["latest_feed"].get(str(update.effective_chat.id))
+        if lf and lf.get("batch"):
+            due = datetime.now(BOT_TZ) + timedelta(hours=12)
+            context.job_queue.run_once(
+                reminder_job,
+                when=due.astimezone(BOT_TZ),
+                name=f"reminder:{batch_key(update.effective_chat.id, lf['batch'])}",
+                data={"chat_id": update.effective_chat.id, "batch": lf["batch"]}
+            )
+    elif re.match(r"(?i)^actual\s*:", text):
         await actual_cmd(update, context)
+    elif re.match(r"(?i)^status$", text):
+        await status_cmd(update, context)
     else:
-        await update.message.reply_text("I didn’t understand.\n\n" + HELP_TEXT)
+        await update.message.reply_text("I didn’t understand. Type /help for examples.")
 
-# ========= MAIN =========
+# ── Main ──────────────────────────────────────────────────────────────────────
 def main():
     if not TELEGRAM_BOT_TOKEN:
         print("ERROR: Set TELEGRAM_BOT_TOKEN env var.")
         return
-
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start_cmd))
+
+    app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("reload", reload_cmd))
     app.add_handler(CommandHandler("plan", plan_cmd))
-    app.add_handler(CommandHandler("predict", predict_cmd))
+    app.add_handler(CommandHandler("whatif", whatif_cmd))
     app.add_handler(CommandHandler("actual", actual_cmd))
+    app.add_handler(CommandHandler("status", status_cmd))
+    app.add_handler(CommandHandler("chart", chart_cmd))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), text_router))
+    app.add_handler(MessageHandler(filters.Document.MimeType("text/csv"), chart_cmd))
 
-    logger.info("Bot starting…")
+    # Schedule daily summary at 21:35 IST (or env override)
+    schedule_daily_summary(app)
+
+    log.info("Bot starting…")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
