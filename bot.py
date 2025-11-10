@@ -1,10 +1,9 @@
 # ======================================================
-#  PyroVision Assistant – with Oil-Yield Recommendations
-#  (paste entire file as bot.py)
+#  PyroVision Assistant — with Reminders + Daily Summary
 # ======================================================
 
 import os, re, io, json, math, logging
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, time
 from typing import Dict, Tuple, List
 
 import numpy as np
@@ -51,7 +50,6 @@ def load_state():
         if os.path.exists(STATE_FILE):
             with open(STATE_FILE, "r", encoding="utf-8") as f:
                 obj = json.load(f)
-            # shallow merge to keep keys if code updated
             for k, v in obj.items():
                 state[k] = v
             LOG.info("✅ State loaded.")
@@ -75,11 +73,9 @@ def load_zone_rules(path=REPORT, sheet=ZONE_SHEET) -> Dict[str,float]:
         for _, row in df.iterrows():
             feat = str(row.get("zone_time_feature", "")).strip().lower()
             mins = row.get("suggested_minutes", np.nan)
-            if not feat or pd.isna(mins):
-                continue
+            if not feat or pd.isna(mins): continue
             m = re.search(r"(\d{2,3})\s*[–-]\s*(\d{2,3})", feat)
-            if not m:
-                continue
+            if not m: continue
             window = f"{m.group(1)}-{m.group(2)}"
             which  = "separator" if "separator" in feat else "reactor"
             rules[f"{window} {which}"] = float(mins)
@@ -87,7 +83,7 @@ def load_zone_rules(path=REPORT, sheet=ZONE_SHEET) -> Dict[str,float]:
     except Exception as e:
         LOG.warning("Excel load failed (%s). Using defaults.", e)
         rules.update({
-            "50-200 reactor": 165,  # minutes; conservative baselines
+            "50-200 reactor": 165,
             "200-300 reactor": 70,
             "300-400 reactor": 185,
             "300-400 separator": 170,
@@ -142,10 +138,6 @@ def _norm_date(s: str|None) -> str:
         return s
 
 def parse_feed(text: str) -> Dict[str, float|str]:
-    """
-    Accepts:
-      Feed: Radial=5.1T, Nylon=0.6T, Chips=3.4T, Powder=1.5T, batch=92, operator=Ravi, date=09-11-2025
-    """
     payload = re.sub(r"^/?(plan|predict)?\s*feed\s*:\s*|^feed\s*:\s*", "", text, flags=re.I).strip()
     out: Dict[str, float|str] = {}
     for part in re.split(r"[,\n;]+", payload):
@@ -171,14 +163,10 @@ def parse_feed(text: str) -> Dict[str, float|str]:
         else:   val = float(re.sub(r"[^\d.]", "", v) or 0.0)
         out[k] = val
 
-    # standardize keys
     rename = {"radial":"radial","nylon":"nylon","chips":"chips","powder":"powder","kachra":"kachra","others":"others"}
     return {rename.get(k, k): v for k, v in out.items()}
 
 def parse_actual(text: str) -> Dict[str, float|str]:
-    """
-    Actual: 50-200=01:14, 200-300=01:06, 300-400=02:07, 400-450=01:10, 450-480=00:32, oil=40.73, batch=66
-    """
     t = re.sub(r"^/?actual\s*:\s*", "", text, flags=re.I).strip()
     out: Dict[str, float|str] = {}
     for chunk in re.split(r"[;,]+", t):
@@ -221,7 +209,6 @@ class RecoEngine:
             r = float(feed.get("radial",0))/total
             c = float(feed.get("chips",0))/total
             n = float(feed.get("nylon",0))/total
-            # Gentle adjustments based on composition
             for k in list(plan.keys()):
                 if k.startswith("300-400"):
                     plan[k] = max(20, plan[k] * (1.0 + 0.15*(r + 0.5*c - 0.6*n)))
@@ -232,7 +219,6 @@ class RecoEngine:
 engine = RecoEngine(REPORT)
 
 def predict_yield(feed: Dict[str, float|str]) -> Tuple[float,float]:
-    """Return (predicted oil %, confidence 0..1)."""
     total = sum(float(feed.get(k,0) or 0) for k in ("radial","nylon","chips","powder","kachra","others"))
     if total <= 0:
         return (0.0, 0.6)
@@ -242,7 +228,6 @@ def predict_yield(feed: Dict[str, float|str]) -> Tuple[float,float]:
         kg = float(feed.get(k,0) or 0)
         pred += (kg/total) * (w.get(k,0)*100.0)
     pred = max(30.0, min(55.0, pred))
-    # Confidence proxy – more balanced mix => higher
     ratio_spread = np.std([ (float(feed.get(x,0) or 0)/total) for x in ("radial","nylon","chips","powder") ])
     conf = max(0.60, min(0.95, 0.95 - 0.8*ratio_spread))
     return (round(pred,2), round(conf,2))
@@ -259,17 +244,13 @@ def learn_from_actual(feed: Dict[str,float|str], actual_oil: float):
 
 # -------------------- Deviation & recommendations --------------------
 def delta_tips(plan: Dict[str,float], actual_min_by_zonekey: Dict[str,float]) -> Tuple[Dict[str,float], List[str]]:
-    """
-    Compare actual vs plan and produce text tips with graded strength.
-    """
     deltas, tips = {}, []
     def level(absmin: float) -> str:
         return "slightly " if absmin < 20 else "moderately " if absmin < 40 else "significantly "
 
     for z, pmin in plan.items():
         key = z.replace(" ", "")
-        if key not in actual_min_by_zonekey:
-            continue
+        if key not in actual_min_by_zonekey: continue
         am   = actual_min_by_zonekey[key]
         diff = am - pmin
         deltas[z] = diff
@@ -278,12 +259,7 @@ def delta_tips(plan: Dict[str,float], actual_min_by_zonekey: Dict[str,float]) ->
     return deltas, tips
 
 def oil_yield_reco(feed: Dict[str,float|str], predicted: float, actual_oil: float|None, deltas: Dict[str,float]) -> List[str]:
-    """
-    Heuristic recommendations to move oil yield toward predicted/target.
-    Uses zone deviations & simple chemistry rules-of-thumb.
-    """
     adv: List[str] = []
-    # If actual_oil is provided, compare; else provide target guidance vs predicted.
     if actual_oil is not None:
         gap = actual_oil - predicted
         if gap >= 1.0:
@@ -293,21 +269,19 @@ def oil_yield_reco(feed: Dict[str,float|str], predicted: float, actual_oil: floa
             adv.append(f"⚠️ Oil below model by *{gap:+.2f}%*. Suggestions:")
     else:
         adv.append(f"🎯 To reach ~*{predicted:.2f}%* oil, consider:")
-        gap = None
 
-    # Use deviations to decide levers
     early_cut  = (deltas.get("50-200 reactor",0) +
                   deltas.get("200-300 reactor",0) +
                   deltas.get("300-400 reactor",0))
     late_over  = max(0, deltas.get("400-450 reactor",0)) + max(0, deltas.get("450-480 reactor",0))
 
-    if early_cut < -30:  # ran shorter than plan in early zones
+    if early_cut < -30:
         adv.append("• Extend *50-200 / 200-300 / 300-400 reactor* windows to improve primary vaporization.")
-    if late_over > 20:   # stayed longer at high temp than plan
+    if late_over > 20:
         adv.append("• Trim *400-450 / 450-480 reactor* to reduce over-cracking to gas.")
     if "300-400 separator" in deltas and deltas["300-400 separator"] < -20:
         adv.append("• Increase *300-400 separator* residence to capture heavy vapors.")
-    if not adv or len(adv)==(1 if gap and gap<=-1 else 0):
+    if len(adv) <= 1:
         adv.append("• Keep ramps steady; avoid spikes; prioritize stable 300–380 °C vapor draw.")
     return adv
 
@@ -362,6 +336,7 @@ async def cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cid = update.effective_chat.id
     await update.message.reply_text(f"chat_id: `{cid}`\nname/title: *{machine_label(cid)}*", parse_mode="Markdown")
 
+# -------------------- Status --------------------
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     now = datetime.now(BOT_TZ)
     if SUMMARY_CHAT_ID and update.effective_chat.id == SUMMARY_CHAT_ID:
@@ -411,6 +386,99 @@ def remember_feed(chat_id: int, feed: Dict[str,float|str], plan: Dict[str,float]
     }
     save_state()
 
+# ---------- Job helpers (reminders + daily summary) ----------
+def _reminder_job_name(chat_id: int, batch: str, kind: str) -> str:
+    # kind: "once" or "hourly"
+    return f"remind:{kind}:{chat_id}:{batch}"
+
+async def reminder_once(context: ContextTypes.DEFAULT_TYPE):
+    """Runs at +12h after Feed. If still no actual → ping & schedule hourly reminder."""
+    data = context.job.data or {}
+    chat_id = data.get("chat_id")
+    batch   = data.get("batch")
+    cid     = str(chat_id)
+    lf = state["latest_feed"].get(cid)
+    if not lf or lf.get("batch") != batch:
+        return  # different batch now or no feed -> ignore
+
+    # If actual already logged
+    last_act_iso = state["last_actual_ts"].get(cid)
+    if last_act_iso and datetime.fromisoformat(last_act_iso) >= datetime.fromisoformat(lf["ts"]):
+        return
+
+    label = machine_label(chat_id)
+    txt = (f"⚠️ *Reminder:* Actual data not entered yet for *Batch {batch}* "
+           f"on *{label}*. Please send `Actual: ...`")
+    await context.bot.send_message(chat_id, txt, parse_mode="Markdown")
+    if SUMMARY_CHAT_ID:
+        await context.bot.send_message(SUMMARY_CHAT_ID, f"🔔 {txt}", parse_mode="Markdown")
+
+    # schedule hourly follow-ups (if not already)
+    hourly_name = _reminder_job_name(chat_id, batch, "hourly")
+    if not context.job_queue.get_jobs_by_name(hourly_name):
+        context.job_queue.run_repeating(
+            callback=reminder_hourly,
+            interval=3600,  # every hour
+            first=3600,     # start in 1 hour after first reminder
+            name=hourly_name,
+            data={"chat_id": chat_id, "batch": batch},
+            chat_id=chat_id,
+        )
+
+async def reminder_hourly(context: ContextTypes.DEFAULT_TYPE):
+    """Tops up reminder hourly until actual arrives (or batch replaced)."""
+    data = context.job.data or {}
+    chat_id = data.get("chat_id")
+    batch   = data.get("batch")
+    cid     = str(chat_id)
+    lf = state["latest_feed"].get(cid)
+
+    # stop conditions
+    if not lf or lf.get("batch") != batch:
+        context.job.schedule_removal()
+        return
+
+    last_act_iso = state["last_actual_ts"].get(cid)
+    if last_act_iso and datetime.fromisoformat(last_act_iso) >= datetime.fromisoformat(lf["ts"]):
+        context.job.schedule_removal()
+        return
+
+    label = machine_label(chat_id)
+    await context.bot.send_message(
+        chat_id,
+        f"⏰ Still waiting for *Actual* of *Batch {batch}* on *{label}*.",
+        parse_mode="Markdown"
+    )
+
+async def daily_summary(context: ContextTypes.DEFAULT_TYPE):
+    """21:35 IST summary into Summary group."""
+    if not SUMMARY_CHAT_ID: return
+    now = datetime.now(BOT_TZ)
+    lines = [f"📊 *Daily Summary* — {now.strftime('%d-%b-%Y (%A) %H:%M')} IST"]
+    for cid_str,label in MACHINE_MAP.items():
+        lf = state["latest_feed"].get(cid_str)
+        st = "Idle"
+        if lf:
+            feed_ts = datetime.fromisoformat(lf["ts"]).astimezone(BOT_TZ)
+            hours   = (now - feed_ts).total_seconds()/3600
+            last_act_iso = state["last_actual_ts"].get(cid_str)
+            completed = last_act_iso and (datetime.fromisoformat(last_act_iso) >= datetime.fromisoformat(lf["ts"]))
+            if hours <= 12 and not completed:
+                st = f"Running (batch {lf.get('batch','?')})"
+            elif completed or hours > 12:
+                st = f"Completed (batch {lf.get('batch','?')}, {lf.get('date','')})"
+        lines.append(f"• {label}: {st}")
+    await context.bot.send_message(SUMMARY_CHAT_ID, "\n".join(lines), parse_mode="Markdown")
+
+def schedule_daily_summary(app: Application):
+    # 21:35 IST every day
+    app.job_queue.run_daily(
+        daily_summary,
+        time=time(hour=21, minute=35, tzinfo=BOT_TZ),
+        name="daily_summary",
+    )
+
+# -------------------- Plan / WhatIf / Actual --------------------
 async def plan_core(update: Update, context: ContextTypes.DEFAULT_TYPE, feed_text: str, predict_only=False):
     chat_id = update.effective_chat.id
     label   = machine_label(chat_id)
@@ -420,8 +488,23 @@ async def plan_core(update: Update, context: ContextTypes.DEFAULT_TYPE, feed_tex
     remember_feed(chat_id, feed, plan)
 
     date_str = _norm_date(str(feed.get("date","")))
-    batch = feed.get("batch","?")
+    batch = str(feed.get("batch","")).strip() or "?"
     oper  = feed.get("operator","?")
+
+    # schedule reminders if batch present (12h then hourly)
+    if batch != "?":
+        # cancel any prior reminders for same machine (safety)
+        for name in (_reminder_job_name(chat_id, batch, "once"), _reminder_job_name(chat_id, batch, "hourly")):
+            for job in context.job_queue.get_jobs_by_name(name):
+                job.schedule_removal()
+
+        context.job_queue.run_once(
+            callback=reminder_once,
+            when=timedelta(hours=12),
+            name=_reminder_job_name(chat_id, batch, "once"),
+            data={"chat_id": chat_id, "batch": batch},
+            chat_id=chat_id,
+        )
 
     msg = []
     msg.append(f"📒 *{label}* — *Batch* {batch}, *Operator* {oper}")
@@ -453,46 +536,45 @@ async def cmd_actual(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     actual_raw = parse_actual(update.message.text)
     plan = lf.get("plan", {})
-    # build "actual minutes by zone key"
     actual_min = {k: float(v) for k,v in actual_raw.items() if re.match(r"\d{2,3}-\d{2,3}", k)}
 
-    # deviations + tips
     deltas, zone_tips = delta_tips(plan, actual_min)
 
-    # oil recommendations
     feed = lf.get("feed", {})
     predicted, _ = predict_yield(feed)
     actual_oil = float(actual_raw.get("oil")) if "oil" in actual_raw else None
     oil_tips   = oil_yield_reco(feed, predicted, actual_oil, deltas)
 
-    # learning
+    # learning + mark actual time
     if actual_oil is not None:
         learn_from_actual(feed, actual_oil)
-        state["last_actual_ts"][cid] = datetime.now(BOT_TZ).isoformat()
-        save_state()
+    state["last_actual_ts"][cid] = datetime.now(BOT_TZ).isoformat()
+    save_state()
 
-    # Compose reply
+    # cancel reminders for this batch
+    batch = lf.get("batch","")
+    if batch:
+        for name in (_reminder_job_name(chat_id, batch, "once"), _reminder_job_name(chat_id, batch, "hourly")):
+            for job in context.job_queue.get_jobs_by_name(name):
+                job.schedule_removal()
+
+    # Compose reply (full block + chart)
     lines = ["📊 *Deviation vs plan (min):*"]
     for z in sorted(deltas.keys(), key=lambda s: int(s.split("-")[0])):
         lines.append(f"{z}: {deltas[z]:+.0f}")
-
     if zone_tips:
         lines.append("\n🛠️ *Zone Recommendations:*")
         lines.extend(zone_tips)
     else:
         lines.append("\n✅ Near-optimal execution vs plan.")
-
     lines.append("\n🛢️ *Oil-Yield Guidance:*")
     lines.extend(oil_tips)
 
-    # Send text
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
-    # Send chart
     buf = chart_plan_vs_actual(plan, actual_min)
     await context.bot.send_photo(chat_id, photo=InputFile(buf, filename="plan_vs_actual.png"))
 
-    # Fan-out notice to Summary
     if SUMMARY_CHAT_ID:
         await context.bot.send_message(
             SUMMARY_CHAT_ID,
@@ -519,6 +601,8 @@ def main():
     load_state()
 
     app = Application.builder().token(TOKEN).build()
+
+    # Commands
     app.add_handler(CommandHandler("start",  cmd_start))
     app.add_handler(CommandHandler("help",   cmd_help))
     app.add_handler(CommandHandler("reload", cmd_reload))
@@ -528,6 +612,9 @@ def main():
     app.add_handler(CommandHandler("whatif", cmd_whatif))
     app.add_handler(CommandHandler("actual", cmd_actual))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, router))
+
+    # Schedule daily summary (21:35 IST)
+    schedule_daily_summary(app)
 
     LOG.info("✅ Bot ready. Polling…")
     app.run_polling()
