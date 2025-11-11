@@ -1,10 +1,16 @@
 # ======================================================
-#  PyroVision Assistant — with Reminders + Daily Summary
+#  PyroVision Assistant — Telegram + Excel + AI (v2)
+#  - Feed  → Plan + Predicted Oil (+ summary fan-out)
+#  - Actual → Deviations + Oil tips + Grade + Chart
+#  - Auto-learning on every Actual
+#  - 12h reminder + hourly nudges until Actual arrives
+#  - Daily summary 21:35 IST
+#  - Robust parsing & clear status rules
 # ======================================================
 
 import os, re, io, json, math, logging
-from datetime import datetime, timedelta, timezone, time
-from typing import Dict, Tuple, List
+from datetime import datetime, timedelta, time
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -12,36 +18,42 @@ import matplotlib.pyplot as plt
 
 from telegram import Update, InputFile
 from telegram.ext import (
-    Application, CommandHandler, MessageHandler, ContextTypes, filters
+    Application, CommandHandler, MessageHandler,
+    ContextTypes, filters
 )
 
-# -------------------- Config & Logging --------------------
+# ── Logging ───────────────────────────────────────────
 LOG = logging.getLogger("pyro_bot")
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
 )
 
-BOT_TZ  = timezone(timedelta(hours=5, minutes=30))  # IST
-TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN", "")
-REPORT  = os.getenv("REPORT_PATH", "pyrolysis_feed_temp_ZONE_TIME_report.xlsx")
-ZONE_SHEET = os.getenv("ZONE_SHEET", "ZoneTime_Recommendations")
+# ── Config via env ────────────────────────────────────
+BOT_TZ = ZoneInfo("Asia/Kolkata")
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+REPORT_PATH = os.environ.get("REPORT_PATH", "pyrolysis_feed_temp_ZONE_TIME_report.xlsx")
+ZONE_SHEET = os.environ.get("ZONE_SHEET", "ZoneTime_Recommendations")
 
-SUMMARY_CHAT_ID = int(os.getenv("SUMMARY_CHAT_ID", "0") or 0)
+# Summary group (optional)
+SUMMARY_CHAT_ID = int(os.environ.get("SUMMARY_CHAT_ID", "0") or "0")
+
+# Machine map JSON: {"-100111": "Machine 1296 (R-1)", ...}
 try:
-    MACHINE_MAP: Dict[str, str] = json.loads(os.getenv("MACHINE_MAP", "{}"))
+    MACHINE_MAP = json.loads(os.environ.get("MACHINE_MAP", "{}"))
 except Exception:
     MACHINE_MAP = {}
 
+# ── Persistent state on disk ─────────────────────────
 STATE_FILE = "bot_state.json"
-
-# -------------------- Persistent state --------------------
 state = {
-    "weights": {  # rough starting oil potential by category (fraction of feed mass)
-        "radial": 0.46, "nylon": 0.41, "chips": 0.46, "powder": 0.53, "kachra": 0.40, "others": 0.40
+    "weights": {  # per-kg base oil fraction priors (learned)
+        "radial": 0.46, "nylon": 0.42, "chips": 0.46, "powder": 0.53,
+        "kachra": 0.40, "others": 0.40
     },
-    "latest_feed": {},      # chat_id -> {ts,batch,operator,feed,plan,date}
-    "last_actual_ts": {},   # chat_id -> iso
+    "latest_feed": {},     # chat_id(str) -> {ts, batch, operator, date_str, feed, plan}
+    "last_actual_ts": {},  # chat_id(str) -> iso timestamp
+    "reminders": {}        # key(chat:batch) -> {"chat_id": int, "batch": str}
 }
 
 def load_state():
@@ -50,6 +62,7 @@ def load_state():
         if os.path.exists(STATE_FILE):
             with open(STATE_FILE, "r", encoding="utf-8") as f:
                 obj = json.load(f)
+            # merge shallowly to keep defaults if keys missing
             for k, v in obj.items():
                 state[k] = v
             LOG.info("✅ State loaded.")
@@ -65,239 +78,258 @@ def save_state():
     except Exception as e:
         LOG.warning(f"⚠️ Could not save state: {e}")
 
-# -------------------- Excel rules --------------------
-def load_zone_rules(path=REPORT, sheet=ZONE_SHEET) -> Dict[str,float]:
-    rules: Dict[str,float] = {}
+# ── Excel zone rules ─────────────────────────────────
+def load_zone_rules(path=REPORT_PATH, sheet=ZONE_SHEET):
+    rules = {}
     try:
         df = pd.read_excel(path, sheet_name=sheet)
         for _, row in df.iterrows():
             feat = str(row.get("zone_time_feature", "")).strip().lower()
             mins = row.get("suggested_minutes", np.nan)
-            if not feat or pd.isna(mins): continue
-            m = re.search(r"(\d{2,3})\s*[–-]\s*(\d{2,3})", feat)
-            if not m: continue
+            if not feat or pd.isna(mins):
+                continue
+            m = re.search(r"(\d{2,3})\s*[-–]\s*(\d{2,3})", feat)
+            if not m:
+                continue
             window = f"{m.group(1)}-{m.group(2)}"
-            which  = "separator" if "separator" in feat else "reactor"
+            which = "separator" if "separator" in feat else "reactor"
             rules[f"{window} {which}"] = float(mins)
-        LOG.info("Loaded %d zone rules from Excel.", len(rules))
+        LOG.info(f"Loaded {len(rules)} zone rules from Excel.")
     except Exception as e:
-        LOG.warning("Excel load failed (%s). Using defaults.", e)
-        rules.update({
-            "50-200 reactor": 165,
-            "200-300 reactor": 70,
-            "300-400 reactor": 185,
-            "300-400 separator": 170,
-            "400-450 reactor": 75,
-            "450-480 reactor": 20,
-            "480-500 reactor": 0,
-            "500-520 reactor": 0,
-        })
+        LOG.warning(f"⚠️ Failed to load Excel rules: {e} — using safe defaults.")
+        rules = {
+            "50-200 reactor": 165, "200-300 reactor": 68, "300-400 reactor": 185,
+            "300-400 separator": 175, "400-450 reactor": 75, "450-480 reactor": 20,
+            "480-500 reactor": 0, "500-520 reactor": 0
+        }
     return rules
 
 ZONE_RULES = load_zone_rules()
 
-# -------------------- Utilities & parsing --------------------
-def to_hhmmss(minutes: float|int|None) -> str:
+# ── Small helpers ────────────────────────────────────
+def klabel(chat_id: int) -> str:
+    return MACHINE_MAP.get(str(chat_id)) or f"{chat_id}"
+
+def to_hhmmss(minutes: float | int | None) -> str:
     if minutes is None or (isinstance(minutes, float) and math.isnan(minutes)):
-        return "-"
+        return "00:00:00"
     total = int(round(float(minutes) * 60))
-    h, r  = divmod(total, 3600)
-    m, s  = divmod(r, 60)
+    h, rem = divmod(total, 3600)
+    m, s = divmod(rem, 60)
     return f"{h:02d}:{m:02d}:{s:02d}"
 
 def hhmmss_to_minutes(s: str) -> float:
     s = s.strip()
     if ":" not in s:
         return float(re.sub(r"[^\d.]", "", s) or 0.0)
-    p = list(map(int, s.split(":")))
-    if len(p) == 3:
-        h, m, sec = p;  return h*60 + m + sec/60
-    if len(p) == 2:
-        m, sec = p;     return m + sec/60
+    parts = [int(x) for x in s.split(":")]
+    if len(parts) == 3:
+        h, m, sec = parts
+        return h * 60 + m + sec / 60
+    if len(parts) == 2:
+        m, sec = parts
+        return m + sec / 60
     return 0.0
 
-def _norm_key(k: str) -> str:
-    return re.sub(r"[^a-z0-9\-]", "", k.lower())
+def norm_key(s: str) -> str:
+    return re.sub(r"[^a-z0-9\-]", "", s.lower())
 
-def _norm_date(s: str|None) -> str:
-    """Return 'dd-Mon-YYYY (Weekday)' in IST. Accepts common dd/mm/yy etc. If empty: now."""
+def _norm_date(s: str | None) -> str:
+    """Normalize various date inputs and include weekday, IST."""
     if not s:
-        now = datetime.now(BOT_TZ);  return now.strftime("%d-%b-%Y (%A)")
+        now = datetime.now(BOT_TZ)
+        return now.strftime("%d-%b-%Y (%A)")
     s = s.strip()
-    for fmt in ("%d-%m-%Y", "%d.%m.%Y", "%d/%m/%Y", "%d-%m-%y", "%d.%m.%y", "%d/%m/%y", "%Y-%m-%d"):
+    # common formats
+    for fmt in ("%d-%m-%Y", "%d.%m.%Y", "%d/%m/%Y", "%d-%b-%Y", "%d.%b.%Y", "%d/%b/%Y",
+                "%Y-%m-%d", "%Y/%m/%d"):
         try:
             dt = datetime.strptime(s, fmt).replace(tzinfo=BOT_TZ)
             return dt.strftime("%d-%b-%Y (%A)")
         except Exception:
             continue
+    # try ISO
     try:
         dt = datetime.fromisoformat(s)
-        if dt.tzinfo is None: dt = dt.replace(tzinfo=BOT_TZ)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=BOT_TZ)
         return dt.astimezone(BOT_TZ).strftime("%d-%b-%Y (%A)")
     except Exception:
         return s
 
-def parse_feed(text: str) -> Dict[str, float|str]:
-    payload = re.sub(r"^/?(plan|predict)?\s*feed\s*:\s*|^feed\s*:\s*", "", text, flags=re.I).strip()
-    out: Dict[str, float|str] = {}
-    for part in re.split(r"[,\n;]+", payload):
-        part = part.strip()
-        if not part: continue
-        if "=" in part:
-            k, v = [x.strip() for x in part.split("=", 1)]
-        else:
-            m = re.match(r"([A-Za-z]+)\s+([\d.]+)", part)
-            if not m: continue
-            k, v = m.group(1), m.group(2)
-        k = _norm_key(k)
+def batch_key(chat_id: int, batch: str | int | None) -> str:
+    return f"{chat_id}:{batch or ''}"
 
-        if k in ("batch","operator","date","machine"):
-            out[k] = v
-            continue
-
-        v = v.replace("ton", "T").replace("mt","T").replace("kg","K")
-        mT = re.match(r"([\d.]+)\s*[tT]$", v)
-        mK = re.match(r"([\d.]+)\s*[kK]$", v)
-        if mT: val = float(mT.group(1)) * 1000.0
-        elif mK: val = float(mK.group(1))
-        else:   val = float(re.sub(r"[^\d.]", "", v) or 0.0)
-        out[k] = val
-
-    rename = {"radial":"radial","nylon":"nylon","chips":"chips","powder":"powder","kachra":"kachra","others":"others"}
-    return {rename.get(k, k): v for k, v in out.items()}
-
-def parse_actual(text: str) -> Dict[str, float|str]:
-    t = re.sub(r"^/?actual\s*:\s*", "", text, flags=re.I).strip()
-    out: Dict[str, float|str] = {}
-    for chunk in re.split(r"[;,]+", t):
-        chunk = chunk.strip()
-        if not chunk or "=" not in chunk: continue
-        k, v = [x.strip() for x in chunk.split("=", 1)]
-        lk = _norm_key(k)
-        if lk in ("oil","oil%"):
-            out["oil"] = float(re.sub(r"[^\d.]", "", v) or 0.0)
-        elif lk == "batch":
-            out["batch"] = v
-        elif re.match(r"\d{2,3}-\d{2,3}", lk):
-            out[lk] = hhmmss_to_minutes(v)
-    return out
-
-def machine_label(chat_id: int) -> str:
-    return MACHINE_MAP.get(str(chat_id)) or MACHINE_MAP.get(str(int(chat_id))) or str(chat_id)
-
-def pretty_plan(plan: Dict[str,float]) -> str:
-    def keyfn(s: str): m=re.match(r"(\d{2,3})", s); return (int(m.group(1)) if m else 999, s)
+def pretty_plan(plan: dict[str, float]) -> str:
+    def keyer(z):  # sort by start temp
+        m = re.match(r"(\d{2,3})-", z)
+        return int(m.group(1)) if m else 999
     lines = []
-    for z in sorted(plan.keys(), key=keyfn):
+    for z in sorted(plan.keys(), key=keyer):
         lines.append(f"{z}: {to_hhmmss(plan[z])}")
     return "\n".join(lines)
 
-# -------------------- Planning & yield model --------------------
-class RecoEngine:
-    def __init__(self, path: str):
-        self.path = path
-        self.zone_defaults: Dict[str,float] = {}
-        self._load()
+# ── Parsing ──────────────────────────────────────────
+def parse_feed(text: str) -> dict:
+    # Accept "Feed: Radial=5.1T, Nylon=0.6T, Chips=3.4T, Powder=1.5T, batch=92, operator=Ravi, date=.."
+    t = re.sub(r"^/?(plan\s+)?feed\s*:\s*", "", text, flags=re.I).strip()
+    out = {}
+    for part in re.split(r"[,\n;]+", t):
+        part = part.strip()
+        if not part:
+            continue
+        if "=" in part:
+            k, v = [x.strip() for x in part.split("=", 1)]
+        else:
+            m = re.match(r"([A-Za-z\-]+)\s+([\d.]+)\s*([tTkKgG]*)", part)
+            if not m:
+                continue
+            k = m.group(1)
+            v = f"{m.group(2)}{m.group(3)}"
+        lk = norm_key(k)
+        if lk in ("operator", "batch", "date"):
+            out[lk] = v
+            continue
+        # value → kg
+        v = v.replace("ton", "T")
+        mT = re.match(r"([\d.]+)\s*[tT]\b", v)
+        mK = re.match(r"([\d.]+)\s*[kK][gG]?\b", v)
+        if mT:
+            val = float(mT.group(1)) * 1000.0
+        elif mK:
+            val = float(mK.group(1))
+        else:
+            val = float(re.sub(r"[^\d.]", "", v) or 0.0)
+        keymap = {
+            "radial": "radial", "nylon": "nylon", "chips": "chips", "powder": "powder",
+            "kachra": "kachra", "others": "others"
+        }
+        out[keymap.get(lk, lk)] = val
+    # normalize date string for display
+    if "date" in out:
+        out["date"] = _norm_date(str(out["date"]))
+    else:
+        out["date"] = _norm_date(None)
+    return out
 
-    def _load(self):
-        self.zone_defaults = load_zone_rules(self.path, ZONE_SHEET)
+def parse_actual(text: str) -> dict:
+    # “Actual: 50-200=01:10, 200-300=00:45, 300-400=01:20, 400-450=00:22; oil=46.2; batch=92”
+    t = re.sub(r"^/?actual\s*:\s*", "", text, flags=re.I).strip()
+    out = {}
+    for chunk in re.split(r"[;,]+", t):
+        if "=" not in chunk:
+            continue
+        k, v = [x.strip() for x in chunk.split("=", 1)]
+        lk = norm_key(k)
+        if lk in ("oil", "oilyield", "oilpercent", "oilpct"):
+            out["oil"] = float(re.sub(r"[^\d.]", "", v) or 0.0)
+        elif lk == "batch":
+            out["batch"] = v
+        elif re.match(r"\d{2,3}\s*-\s*\d{2,3}", k):
+            zkey = re.sub(r"\s+", "", k)
+            out[zkey] = hhmmss_to_minutes(v)
+    return out
 
-    def plan(self, feed: Dict[str, float|str]) -> Dict[str,float]:
-        plan = dict(self.zone_defaults)
-        total = sum(float(feed.get(k,0) or 0) for k in ("radial","nylon","chips","powder","kachra","others"))
+# ── Recommendation Engine ───────────────────────────
+class Reco:
+    def __init__(self, base_rules: dict[str, float]):
+        self.rules = base_rules.copy()
+
+    def plan(self, feed: dict) -> dict[str, float]:
+        plan = self.rules.copy()
+        total = sum(feed.get(k, 0.0) for k in ("radial", "nylon", "chips", "powder", "kachra", "others"))
         if total > 0:
-            r = float(feed.get("radial",0))/total
-            c = float(feed.get("chips",0))/total
-            n = float(feed.get("nylon",0))/total
-            for k in list(plan.keys()):
-                if k.startswith("300-400"):
-                    plan[k] = max(20, plan[k] * (1.0 + 0.15*(r + 0.5*c - 0.6*n)))
-                if k.startswith("200-300"):
-                    plan[k] = max(15, plan[k] * (1.0 + 0.10*r - 0.05*n))
+            radial = feed.get("radial", 0.0) / total
+            nylon  = feed.get("nylon", 0.0) / total
+            chips  = feed.get("chips", 0.0) / total
+            # Nudge 300–400 zones (reactor + separator) by composition
+            adj = 1.0 + 0.18 * (radial + 0.6 * chips - 0.6 * nylon)
+            for z in list(plan.keys()):
+                if z.startswith("300-400"):
+                    plan[z] = max(20, plan[z] * adj)
+                elif z.startswith("200-300"):
+                    plan[z] = max(15, plan[z] * (1.0 + 0.10 * radial - 0.05 * nylon))
         return plan
 
-engine = RecoEngine(REPORT)
+ENGINE = Reco(ZONE_RULES)
 
-def predict_yield(feed: Dict[str, float|str]) -> Tuple[float,float]:
-    total = sum(float(feed.get(k,0) or 0) for k in ("radial","nylon","chips","powder","kachra","others"))
+# ── Yield model (tiny & online-learned) ──────────────
+def predict_yield(feed: dict) -> tuple[float, float]:
+    total = sum(feed.get(k, 0.0) for k in ("radial", "nylon", "chips", "powder", "kachra", "others"))
     if total <= 0:
-        return (0.0, 0.6)
+        return (0.0, 0.60)
     w = state["weights"]
-    pred = 0.0
-    for k in ("radial","nylon","chips","powder","kachra","others"):
-        kg = float(feed.get(k,0) or 0)
-        pred += (kg/total) * (w.get(k,0)*100.0)
-    pred = max(30.0, min(55.0, pred))
-    ratio_spread = np.std([ (float(feed.get(x,0) or 0)/total) for x in ("radial","nylon","chips","powder") ])
-    conf = max(0.60, min(0.95, 0.95 - 0.8*ratio_spread))
-    return (round(pred,2), round(conf,2))
+    base = 0.0
+    for k, kg in feed.items():
+        if k in w:
+            base += (kg / total) * (w[k] * 100.0)
+    # Guard rails
+    pred = max(30.0, min(55.0, base))
+    # Confidence: balanced mixes → higher
+    ratios = [feed.get(x, 0.0) / total for x in ("radial", "nylon", "chips", "powder") if total > 0]
+    conf = max(0.60, min(0.95, 0.95 - 0.8 * np.std(ratios)))
+    return (round(pred, 2), round(conf, 2))
 
-def learn_from_actual(feed: Dict[str,float|str], actual_oil: float):
-    total = sum(float(feed.get(k,0) or 0) for k in ("radial","nylon","chips","powder","kachra","others"))
-    if total <= 0: return
-    pred,_ = predict_yield(feed)
-    err = (actual_oil - pred)/100.0
-    for k in ("radial","nylon","chips","powder","kachra","others"):
-        share = float(feed.get(k,0) or 0)/total
-        state["weights"][k] = float(state["weights"].get(k,0)) + 0.01 * err * share
+def learn_from_actual(feed: dict, actual_oil_pct: float):
+    total = sum(feed.get(k, 0.0) for k in ("radial", "nylon", "chips", "powder", "kachra", "others"))
+    if total <= 0:
+        return
+    pred, _ = predict_yield(feed)
+    err = (actual_oil_pct - pred) / 100.0
+    for k in ("radial", "nylon", "chips", "powder", "kachra", "others"):
+        share = feed.get(k, 0.0) / total
+        state["weights"][k] += 0.01 * err * share  # gentle learning
     save_state()
 
-# -------------------- Deviation & recommendations --------------------
-def delta_tips(plan: Dict[str,float], actual_min_by_zonekey: Dict[str,float]) -> Tuple[Dict[str,float], List[str]]:
-    deltas, tips = {}, []
-    def level(absmin: float) -> str:
-        return "slightly " if absmin < 20 else "moderately " if absmin < 40 else "significantly "
+def grade_from_deviation(oil_delta: float) -> tuple[str, str]:
+    """Return emoji + grade string based on oil delta vs prediction."""
+    if oil_delta >= +1.0:
+        return ("🟢", "A (above prediction)")
+    if oil_delta >= -1.0:
+        return ("🟡", "B (near prediction)")
+    return ("🔴", "C (below prediction)")
 
-    for z, pmin in plan.items():
-        key = z.replace(" ", "")
-        if key not in actual_min_by_zonekey: continue
-        am   = actual_min_by_zonekey[key]
-        diff = am - pmin
-        deltas[z] = diff
-        if abs(diff) >= 10:
-            tips.append(f"• {level(abs(diff))}{'reduce' if diff>0 else 'increase'} *{z}* by ~{abs(diff):.0f} min")
-    return deltas, tips
+def oil_tips(feed: dict, plan: dict, actual: dict, actual_oil: float, pred_oil: float) -> list[str]:
+    """Actionable hints: look at key zones & separator."""
+    tips = []
+    # Compare minutes vs plan for major drivers
+    def get(z): return actual.get(z.replace(" ", ""), None)
+    d_300r = (get("300-400 reactor") or 0) - plan.get("300-400 reactor", 0)
+    d_300s = (get("300-400 separator") or 0) - plan.get("300-400 separator", 0)
+    d_200r = (get("200-300 reactor") or 0) - plan.get("200-300 reactor", 0)
 
-def oil_yield_reco(feed: Dict[str,float|str], predicted: float, actual_oil: float|None, deltas: Dict[str,float]) -> List[str]:
-    adv: List[str] = []
-    if actual_oil is not None:
-        gap = actual_oil - predicted
-        if gap >= 1.0:
-            adv.append(f"✅ Oil yield is *{gap:+.2f}%* vs predicted — great job. Keep this profile.")
-            return adv
-        elif gap <= -1.0:
-            adv.append(f"⚠️ Oil below model by *{gap:+.2f}%*. Suggestions:")
+    oil_delta = actual_oil - pred_oil
+
+    if oil_delta < -1.0:
+        # Below predicted → likely under-condensation or over-cracking
+        if d_300s < -10:
+            tips.append("Increase *300–400 separator* by ~15–25 min (more condensation).")
+        if d_300r < -15:
+            tips.append("Extend *300–400 reactor* by ~20–30 min for heavier mix completion.")
+        if d_200r < -10:
+            tips.append("Slightly extend *200–300 reactor* by ~10–15 min (stabilize ramp).")
+        tips.append("Check line losses & condenser ∆T; avoid sharp temp spikes.")
+    elif oil_delta > +1.0:
+        tips.append("Oil above prediction — consider trimming *300–400 reactor* by ~10–20 min next time to reduce cycle time.")
     else:
-        adv.append(f"🎯 To reach ~*{predicted:.2f}%* oil, consider:")
+        tips.append("Near prediction — fine tune separator by ±10 min to chase +0.5–1.0% oil.")
 
-    early_cut  = (deltas.get("50-200 reactor",0) +
-                  deltas.get("200-300 reactor",0) +
-                  deltas.get("300-400 reactor",0))
-    late_over  = max(0, deltas.get("400-450 reactor",0)) + max(0, deltas.get("450-480 reactor",0))
+    return tips
 
-    if early_cut < -30:
-        adv.append("• Extend *50-200 / 200-300 / 300-400 reactor* windows to improve primary vaporization.")
-    if late_over > 20:
-        adv.append("• Trim *400-450 / 450-480 reactor* to reduce over-cracking to gas.")
-    if "300-400 separator" in deltas and deltas["300-400 separator"] < -20:
-        adv.append("• Increase *300-400 separator* residence to capture heavy vapors.")
-    if len(adv) <= 1:
-        adv.append("• Keep ramps steady; avoid spikes; prioritize stable 300–380 °C vapor draw.")
-    return adv
-
-# -------------------- Chart --------------------
-def chart_plan_vs_actual(plan: Dict[str,float], actual: Dict[str,float]|None=None) -> io.BytesIO:
-    zones = [z for z in sorted(plan.keys(), key=lambda s: int(s.split("-")[0]))]
+# ── Chart builders ───────────────────────────────────
+def chart_plan_vs_actual(plan: dict[str, float], actual: dict[str, float] | None = None) -> io.BytesIO:
+    zones = []
+    for z in sorted(plan.keys(), key=lambda s: int(s.split("-")[0])):
+        zones.append(z)
     pmins = [plan[z] for z in zones]
-    amins = [actual.get(z.replace(" ",""), np.nan) if actual else np.nan for z in zones]
-    x = np.arange(len(zones))
-    width = 0.38
+    amins = [ (actual or {}).get(z.replace(" ", ""), np.nan) for z in zones ]
 
-    fig, ax = plt.subplots(figsize=(10,3), dpi=200)
-    ax.bar(x - width/2, pmins, width, label="Plan (min)")
+    x = np.arange(len(zones))
+    fig, ax = plt.subplots(figsize=(10, 3), dpi=170)
+    ax.bar(x, pmins, width=0.35, label="Plan (min)")
     if actual:
-        ax.bar(x + width/2, amins, width, label="Actual (min)")
-    ax.set_xticks(x, zones, rotation=18, ha="right")
+        ax.bar(x + 0.35, amins, width=0.35, label="Actual (min)")
+    ax.set_xticks(x + (0.35/2 if actual else 0), zones, rotation=22)
     ax.set_ylabel("Minutes")
     ax.legend()
     ax.grid(True, axis="y", alpha=0.25)
@@ -308,316 +340,272 @@ def chart_plan_vs_actual(plan: Dict[str,float], actual: Dict[str,float]|None=Non
     buf.seek(0)
     return buf
 
-# -------------------- Bot replies --------------------
+# ── Messaging helpers ────────────────────────────────
+async def fanout_summary(context: ContextTypes.DEFAULT_TYPE, text: str):
+    if SUMMARY_CHAT_ID:
+        try:
+            await context.bot.send_message(SUMMARY_CHAT_ID, text, parse_mode="Markdown")
+        except Exception:
+            pass
+
+# ── Handlers ─────────────────────────────────────────
 HELP = (
     "*Commands*\n"
-    "• Send **Feed:** `Feed: Radial=5.1T, Nylon=0.6T, Chips=3.4T, Powder=1.5T, batch=92, operator=Ravi, date=09-11-2025`\n"
-    "  → Plan + Predicted oil (also posted in Summary).\n"
-    "• Send **Actual:** `Actual: 50-200=01:14, 200-300=01:06, 300-400=02:07, 400-450=01:10, 450-480=00:32, oil=40.7; batch=92`\n"
-    "  → Deviations + *Recommendations* + chart (and the model learns).\n"
-    "• `/status` → Machine status (or all in the Summary group)\n"
-    "• `/reload` → Reload Excel rules\n"
-    "• `/id` → Show this chat’s id and label\n"
+    "• Send *Feed:* `Feed: Radial=5.1T, Nylon=0.6T, Chips=3.4T, Powder=1.5T, batch=92, operator=Ravi, date=09-11-2025`\n"
+    "  → Plan + Predicted oil (+ posted in Summary).\n"
+    "• Send *Actual:* `Actual: 50-200=01:14, 200-300=01:06, 300-400=02:07, 400-450=01:10, 450-480=00:32, oil=40.7, batch=92`\n"
+    "  → Deviations + *Recommendations* + chart (+ model learns).\n"
+    "• `/status` → Machine status (in Summary it lists all machines).\n"
+    "• `/reload` → Reload Excel rules.\n"
+    "• `/id` → Show this chat’s id and label.\n"
 )
 
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("PyroVision Assistant ready ✅\n\n" + HELP, parse_mode="Markdown")
 
-async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(HELP, parse_mode="Markdown")
 
-async def cmd_reload(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    engine._load()
-    await update.message.reply_text("🔁 Reloaded recommendations from Excel.")
-    if SUMMARY_CHAT_ID:
-        await context.bot.send_message(SUMMARY_CHAT_ID, f"🔁 Rules reloaded by {machine_label(update.effective_chat.id)}")
-
-async def cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def id_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cid = update.effective_chat.id
-    await update.message.reply_text(f"chat_id: `{cid}`\nname/title: *{machine_label(cid)}*", parse_mode="Markdown")
+    await update.message.reply_text(f"chat_id: `{cid}`\nname/title: *{klabel(cid)}*", parse_mode="Markdown")
 
-# -------------------- Status --------------------
-async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    now = datetime.now(BOT_TZ)
-    if SUMMARY_CHAT_ID and update.effective_chat.id == SUMMARY_CHAT_ID:
-        lines = ["🟢 *Machine Status*"]
-        for cid_str, label in MACHINE_MAP.items():
-            lf = state["latest_feed"].get(cid_str)
-            st = "Idle"
-            if lf:
-                feed_ts = datetime.fromisoformat(lf["ts"]).astimezone(BOT_TZ)
-                hours   = (now - feed_ts).total_seconds()/3600
-                last_act_iso = state["last_actual_ts"].get(cid_str)
-                completed = False
-                if last_act_iso:
-                    completed = datetime.fromisoformat(last_act_iso) >= datetime.fromisoformat(lf["ts"])
-                if hours <= 12 and not completed:
-                    st = f"Running (batch {lf.get('batch','?')})"
-                elif completed or hours > 12:
-                    st = f"Completed (batch {lf.get('batch','?')}, {lf.get('date','')})"
-            lines.append(f"• {label}: {st}")
-        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-    else:
-        cid = str(update.effective_chat.id)
-        label = machine_label(update.effective_chat.id)
-        lf = state["latest_feed"].get(cid)
-        st = "Idle"
-        if lf:
-            feed_ts = datetime.fromisoformat(lf["ts"]).astimezone(BOT_TZ)
-            hours   = (now - feed_ts).total_seconds()/3600
-            last_act_iso = state["last_actual_ts"].get(cid)
-            completed = last_act_iso and (datetime.fromisoformat(last_act_iso) >= datetime.fromisoformat(lf["ts"]))
-            if hours <= 12 and not completed:
-                st = f"Running (batch {lf.get('batch','?')})"
-            elif completed or hours > 12:
-                st = f"Completed (batch {lf.get('batch','?')}, {lf.get('date','')})"
-        await update.message.reply_text(f"{label}: {st}")
+async def reload_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global ZONE_RULES, ENGINE
+    ZONE_RULES = load_zone_rules()
+    ENGINE = Reco(ZONE_RULES)
+    await update.message.reply_text("🔁 Reloaded Excel rules.")
 
-# --------------- Feed & Actual processing ---------------
-def remember_feed(chat_id: int, feed: Dict[str,float|str], plan: Dict[str,float]):
-    now = datetime.now(BOT_TZ)
-    state["latest_feed"][str(chat_id)] = {
-        "ts": now.isoformat(),
-        "date": _norm_date(str(feed.get("date",""))),
-        "batch": str(feed.get("batch","")),
-        "operator": str(feed.get("operator","")),
+def remember_feed(chat_id: int, feed: dict, plan: dict):
+    entry = {
+        "ts": datetime.now(BOT_TZ).isoformat(),
+        "batch": str(feed.get("batch", "")),
+        "operator": str(feed.get("operator", "")),
+        "date_str": feed.get("date", _norm_date(None)),
         "feed": feed,
-        "plan": plan,
+        "plan": plan
     }
+    state["latest_feed"][str(chat_id)] = entry
     save_state()
 
-# ---------- Job helpers (reminders + daily summary) ----------
-def _reminder_job_name(chat_id: int, batch: str, kind: str) -> str:
-    # kind: "once" or "hourly"
-    return f"remind:{kind}:{chat_id}:{batch}"
+def schedule_reminders(jobq, chat_id: int, batch: str):
+    """12h reminder, then hourly nudges until cleared by /actual."""
+    # First cancel any existing for same key
+    key = f"rem:{chat_id}:{batch}"
+    for j in jobq.jobs():
+        if j.name == key or j.name.startswith(key + ":nudge"):
+            j.schedule_removal()
+
+    # 12h one-shot
+    jobq.run_once(
+        reminder_once,
+        when=timedelta(hours=12),
+        data={"chat_id": chat_id, "batch": batch},
+        name=key
+    )
+    # Hourly repeating (starts after 13h)
+    jobq.run_repeating(
+        reminder_nudge,
+        interval=3600,
+        first=timedelta(hours=13),
+        data={"chat_id": chat_id, "batch": batch},
+        name=key + ":nudge"
+    )
 
 async def reminder_once(context: ContextTypes.DEFAULT_TYPE):
-    """Runs at +12h after Feed. If still no actual → ping & schedule hourly reminder."""
-    data = context.job.data or {}
-    chat_id = data.get("chat_id")
-    batch   = data.get("batch")
-    cid     = str(chat_id)
-    lf = state["latest_feed"].get(cid)
-    if not lf or lf.get("batch") != batch:
-        return  # different batch now or no feed -> ignore
-
-    # If actual already logged
-    last_act_iso = state["last_actual_ts"].get(cid)
-    if last_act_iso and datetime.fromisoformat(last_act_iso) >= datetime.fromisoformat(lf["ts"]):
-        return
-
-    label = machine_label(chat_id)
+    chat_id = context.job.data["chat_id"]
+    batch = context.job.data["batch"]
     txt = (f"⚠️ *Reminder:* Actual data not entered yet for *Batch {batch}* "
-           f"on *{label}*. Please send `Actual: ...`")
+           f"on *{klabel(chat_id)}*. Please send `Actual: …`")
     await context.bot.send_message(chat_id, txt, parse_mode="Markdown")
-    if SUMMARY_CHAT_ID:
-        await context.bot.send_message(SUMMARY_CHAT_ID, f"🔔 {txt}", parse_mode="Markdown")
+    await fanout_summary(context, f"🔔 {txt}")
 
-    # schedule hourly follow-ups (if not already)
-    hourly_name = _reminder_job_name(chat_id, batch, "hourly")
-    if not context.job_queue.get_jobs_by_name(hourly_name):
-        context.job_queue.run_repeating(
-            callback=reminder_hourly,
-            interval=3600,  # every hour
-            first=3600,     # start in 1 hour after first reminder
-            name=hourly_name,
-            data={"chat_id": chat_id, "batch": batch},
-            chat_id=chat_id,
-        )
-
-async def reminder_hourly(context: ContextTypes.DEFAULT_TYPE):
-    """Tops up reminder hourly until actual arrives (or batch replaced)."""
-    data = context.job.data or {}
-    chat_id = data.get("chat_id")
-    batch   = data.get("batch")
-    cid     = str(chat_id)
-    lf = state["latest_feed"].get(cid)
-
-    # stop conditions
-    if not lf or lf.get("batch") != batch:
+async def reminder_nudge(context: ContextTypes.DEFAULT_TYPE):
+    chat_id = context.job.data["chat_id"]
+    batch = context.job.data["batch"]
+    # stop nudging if actual already logged
+    lf = state["latest_feed"].get(str(chat_id))
+    if not lf or str(lf.get("batch")) != str(batch):
         context.job.schedule_removal()
         return
-
-    last_act_iso = state["last_actual_ts"].get(cid)
-    if last_act_iso and datetime.fromisoformat(last_act_iso) >= datetime.fromisoformat(lf["ts"]):
+    last_act = state["last_actual_ts"].get(str(chat_id))
+    if last_act and datetime.fromisoformat(last_act) >= datetime.fromisoformat(lf["ts"]):
         context.job.schedule_removal()
         return
+    txt = (f"⏰ *Hourly nudge:* Still waiting for *Actual* of Batch {batch} on *{klabel(chat_id)}*.")
+    await context.bot.send_message(chat_id, txt, parse_mode="Markdown")
+    await fanout_summary(context, f"🔔 {txt}")
 
-    label = machine_label(chat_id)
-    await context.bot.send_message(
-        chat_id,
-        f"⏰ Still waiting for *Actual* of *Batch {batch}* on *{label}*.",
-        parse_mode="Markdown"
-    )
-
-async def daily_summary(context: ContextTypes.DEFAULT_TYPE):
-    """21:35 IST summary into Summary group."""
-    if not SUMMARY_CHAT_ID: return
+def status_line_for_chat(cid: int) -> str:
     now = datetime.now(BOT_TZ)
-    lines = [f"📊 *Daily Summary* — {now.strftime('%d-%b-%Y (%A) %H:%M')} IST"]
-    for cid_str,label in MACHINE_MAP.items():
-        lf = state["latest_feed"].get(cid_str)
-        st = "Idle"
-        if lf:
-            feed_ts = datetime.fromisoformat(lf["ts"]).astimezone(BOT_TZ)
-            hours   = (now - feed_ts).total_seconds()/3600
-            last_act_iso = state["last_actual_ts"].get(cid_str)
-            completed = last_act_iso and (datetime.fromisoformat(last_act_iso) >= datetime.fromisoformat(lf["ts"]))
-            if hours <= 12 and not completed:
-                st = f"Running (batch {lf.get('batch','?')})"
-            elif completed or hours > 12:
-                st = f"Completed (batch {lf.get('batch','?')}, {lf.get('date','')})"
-        lines.append(f"• {label}: {st}")
-    await context.bot.send_message(SUMMARY_CHAT_ID, "\n".join(lines), parse_mode="Markdown")
+    lf = state["latest_feed"].get(str(cid))
+    if not lf:
+        return f"{klabel(cid)}: Idle"
+    feed_ts = datetime.fromisoformat(lf["ts"])
+    since = (now - feed_ts).total_seconds() / 3600.0
+    last_act_iso = state["last_actual_ts"].get(str(cid))
+    completed = False
+    if last_act_iso:
+        completed = datetime.fromisoformat(last_act_iso) >= feed_ts
+    if not completed and since <= 12.0:
+        return f"{klabel(cid)}: Running (batch {lf.get('batch','?')})"
+    # completed or >12h
+    date_str = lf.get("date_str", _norm_date(None))
+    return f"{klabel(cid)}: Completed (last batch {lf.get('batch','?')} on {date_str})"
 
-def schedule_daily_summary(app: Application):
-    # 21:35 IST every day
-    app.job_queue.run_daily(
-        daily_summary,
-        time=time(hour=21, minute=35, tzinfo=BOT_TZ),
-        name="daily_summary",
-    )
+async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if SUMMARY_CHAT_ID and update.effective_chat.id == SUMMARY_CHAT_ID:
+        lines = ["🟢 *Machine Status*"]
+        for cid_str in MACHINE_MAP.keys():
+            lines.append("• " + status_line_for_chat(int(cid_str)))
+        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    else:
+        await update.message.reply_text(status_line_for_chat(update.effective_chat.id), parse_mode="Markdown")
 
-# -------------------- Plan / WhatIf / Actual --------------------
-async def plan_core(update: Update, context: ContextTypes.DEFAULT_TYPE, feed_text: str, predict_only=False):
+async def plan_from_feed(update: Update, context: ContextTypes.DEFAULT_TYPE, feed_text: str):
     chat_id = update.effective_chat.id
-    label   = machine_label(chat_id)
-    feed    = parse_feed(feed_text)
-    plan    = engine.plan(feed)
-    pred, conf = predict_yield(feed)
+    feed = parse_feed(feed_text)
+    plan = ENGINE.plan(feed)
     remember_feed(chat_id, feed, plan)
 
-    date_str = _norm_date(str(feed.get("date","")))
-    batch = str(feed.get("batch","")).strip() or "?"
-    oper  = feed.get("operator","?")
-
-    # schedule reminders if batch present (12h then hourly)
-    if batch != "?":
-        # cancel any prior reminders for same machine (safety)
-        for name in (_reminder_job_name(chat_id, batch, "once"), _reminder_job_name(chat_id, batch, "hourly")):
-            for job in context.job_queue.get_jobs_by_name(name):
-                job.schedule_removal()
-
-        context.job_queue.run_once(
-            callback=reminder_once,
-            when=timedelta(hours=12),
-            name=_reminder_job_name(chat_id, batch, "once"),
-            data={"chat_id": chat_id, "batch": batch},
-            chat_id=chat_id,
-        )
+    pred, conf = predict_yield(feed)
+    label = klabel(chat_id)
+    batch = str(feed.get("batch", "—"))
+    oper  = str(feed.get("operator", "—"))
+    date_str = feed.get("date", _norm_date(None))
 
     msg = []
     msg.append(f"📒 *{label}* — *Batch* {batch}, *Operator* {oper}")
     msg.append(f"• *Date* {date_str}")
-    msg.append(f"🛢️ *Feed:* Radial {float(feed.get('radial',0))/1000:.2f}T, Nylon {float(feed.get('nylon',0))/1000:.2f}T, Chips {float(feed.get('chips',0))/1000:.2f}T, Powder {float(feed.get('powder',0))/1000:.2f}T")
+    msg.append(f"🛢️ *Feed:* Radial {feed.get('radial',0)/1000:.2f}T, Nylon {feed.get('nylon',0)/1000:.2f}T, "
+               f"Chips {feed.get('chips',0)/1000:.2f}T, Powder {feed.get('powder',0)/1000:.2f}T")
     msg.append(f"📈 *Predicted Oil:* *{pred:.2f}%*  (confidence {conf:.2f})")
-    if not predict_only:
-        msg.append("\n*Recommended zone minutes (plan):*\n" + pretty_plan(plan))
+    msg.append("\n*Recommended zone minutes (plan):*\n" + pretty_plan(plan))
     text = "\n".join(msg)
 
     await update.message.reply_text(text, parse_mode="Markdown")
-    if SUMMARY_CHAT_ID:
-        await context.bot.send_message(SUMMARY_CHAT_ID, text, parse_mode="Markdown")
+    await fanout_summary(context, text)
 
-async def cmd_plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await plan_core(update, context, update.message.text, predict_only=False)
+    # Schedule reminders if batch present
+    if str(feed.get("batch", "")).strip():
+        schedule_reminders(context.job_queue, chat_id, str(feed["batch"]))
 
-async def cmd_whatif(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    t = re.sub(r"^/?whatif\s*", "", update.message.text, flags=re.I)
-    await plan_core(update, context, t, predict_only=True)
-
-async def cmd_actual(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def actual_from_text(update: Update, context: ContextTypes.DEFAULT_TYPE, actual_text: str):
     chat_id = update.effective_chat.id
-    cid = str(chat_id)
-    lf = state["latest_feed"].get(cid)
+    lf = state["latest_feed"].get(str(chat_id))
     if not lf:
-        await update.message.reply_text("I can't find a recent Feed for this machine. Send the Feed first.")
+        await update.message.reply_text("I don't see a recent *Feed* for this machine. Send `Feed: …` first.", parse_mode="Markdown")
         return
 
-    actual_raw = parse_actual(update.message.text)
+    actual = parse_actual(actual_text)
     plan = lf.get("plan", {})
-    actual_min = {k: float(v) for k,v in actual_raw.items() if re.match(r"\d{2,3}-\d{2,3}", k)}
-
-    deltas, zone_tips = delta_tips(plan, actual_min)
-
     feed = lf.get("feed", {})
-    predicted, _ = predict_yield(feed)
-    actual_oil = float(actual_raw.get("oil")) if "oil" in actual_raw else None
-    oil_tips   = oil_yield_reco(feed, predicted, actual_oil, deltas)
+    # collect deviations
+    deltas = {}
+    for z, pmin in plan.items():
+        zkey = z.replace(" ", "")
+        if zkey in actual:
+            deltas[z] = actual[zkey] - pmin
 
-    # learning + mark actual time
-    if actual_oil is not None:
-        learn_from_actual(feed, actual_oil)
-    state["last_actual_ts"][cid] = datetime.now(BOT_TZ).isoformat()
-    save_state()
+    # Learn from oil % (if given)
+    lines = []
+    oil_line = None
+    if "oil" in actual:
+        pred, _ = predict_yield(feed)
+        learn_from_actual(feed, float(actual["oil"]))
+        state["last_actual_ts"][str(chat_id)] = datetime.now(BOT_TZ).isoformat()
+        save_state()
 
-    # cancel reminders for this batch
-    batch = lf.get("batch","")
-    if batch:
-        for name in (_reminder_job_name(chat_id, batch, "once"), _reminder_job_name(chat_id, batch, "hourly")):
-            for job in context.job_queue.get_jobs_by_name(name):
-                job.schedule_removal()
+        oil_delta = float(actual["oil"]) - pred
+        emoji, grade = grade_from_deviation(oil_delta)
+        tips = oil_tips(feed, plan, actual, float(actual["oil"]), pred)
 
-    # Compose reply (full block + chart)
-    lines = ["📊 *Deviation vs plan (min):*"]
+        oil_line = (f"{emoji} *Oil vs Predicted:* actual *{actual['oil']:.2f}%* "
+                    f"(pred *{pred:.2f}%*, Δ = {oil_delta:+.2f}%) → *Grade {grade}*")
+        lines.append(oil_line)
+        if tips:
+            lines.append("🔧 *Oil yield recommendations:*")
+            for t in tips:
+                lines.append(f"• {t}")
+
+    # Deviation table
+    lines.append("\n📊 *Deviation vs plan (min):*")
     for z in sorted(deltas.keys(), key=lambda s: int(s.split("-")[0])):
         lines.append(f"{z}: {deltas[z]:+.0f}")
-    if zone_tips:
-        lines.append("\n🛠️ *Zone Recommendations:*")
-        lines.extend(zone_tips)
-    else:
-        lines.append("\n✅ Near-optimal execution vs plan.")
-    lines.append("\n🛢️ *Oil-Yield Guidance:*")
-    lines.extend(oil_tips)
 
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    if not oil_line:
+        lines.append("\nℹ️ Add `oil=..` in Actual to get yield grade & tips.")
 
-    buf = chart_plan_vs_actual(plan, actual_min)
-    await context.bot.send_photo(chat_id, photo=InputFile(buf, filename="plan_vs_actual.png"))
+    txt = "\n".join(lines)
+    await update.message.reply_text(txt, parse_mode="Markdown")
 
-    if SUMMARY_CHAT_ID:
-        await context.bot.send_message(
-            SUMMARY_CHAT_ID,
-            f"🧾 Actual logged for *{machine_label(chat_id)}* (batch {lf.get('batch','?')}).",
-            parse_mode="Markdown"
-        )
+    # Chart
+    buf = chart_plan_vs_actual(plan, {k.replace(" ", ""): v for k, v in actual.items() if "-" in k})
+    await context.bot.send_photo(chat_id, InputFile(buf, filename="plan_vs_actual.png"))
 
-# -------------------- Text Router --------------------
-async def router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Notify summary
+    await fanout_summary(context, f"🧾 Actual logged for *{klabel(chat_id)}* (batch {lf.get('batch','?')}).")
+
+# Text router (accept plain "Feed:" and "Actual:")
+async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
-    if re.match(r"(?i)^feed\s*:", text):
-        await plan_core(update, context, text, predict_only=False)
+    if re.match(r"(?i)^feed\s*:", text) or re.match(r"(?i)^plan\s*feed\s*:", text):
+        await plan_from_feed(update, context, text)
     elif re.match(r"(?i)^actual\s*:", text):
-        await cmd_actual(update, context)
+        await actual_from_text(update, context, text)
     elif re.match(r"(?i)^status$", text):
-        await cmd_status(update, context)
+        await status_cmd(update, context)
+    elif re.match(r"(?i)^/id$", text):
+        await id_cmd(update, context)
+    elif re.match(r"(?i)^/reload$", text):
+        await reload_cmd(update, context)
+    elif re.match(r"(?i)^/help$", text) or re.match(r"(?i)^help$", text):
+        await help_cmd(update, context)
     else:
         await update.message.reply_text("I didn’t understand.\n\n" + HELP, parse_mode="Markdown")
 
-# -------------------- Main --------------------
+# ── Daily summary 21:35 IST ─────────────────────────
+async def daily_summary(context: ContextTypes.DEFAULT_TYPE):
+    now = datetime.now(BOT_TZ)
+    title = now.strftime("🧾 *Daily Summary* — %d-%b-%Y (%A) · %H:%M IST")
+    lines = [title]
+    for cid_str, label in MACHINE_MAP.items():
+        lines.append("• " + status_line_for_chat(int(cid_str)))
+    if SUMMARY_CHAT_ID:
+        await context.bot.send_message(SUMMARY_CHAT_ID, "\n".join(lines), parse_mode="Markdown")
+
+def schedule_daily_summary(app: Application):
+    # Every day at 21:35 IST
+    app.job_queue.run_daily(
+        daily_summary,
+        time=time(hour=21, minute=35, tzinfo=BOT_TZ),
+        name="daily_summary"
+    )
+
+# ── Main ─────────────────────────────────────────────
 def main():
-    if not TOKEN:
-        raise RuntimeError("❌ TELEGRAM_BOT_TOKEN env var is missing.")
+    LOG.info("🚀 Starting PyroVision Assistant…")
+    if not TELEGRAM_BOT_TOKEN:
+        raise RuntimeError("Missing TELEGRAM_BOT_TOKEN")
     load_state()
 
-    app = Application.builder().token(TOKEN).build()
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
     # Commands
-    app.add_handler(CommandHandler("start",  cmd_start))
-    app.add_handler(CommandHandler("help",   cmd_help))
-    app.add_handler(CommandHandler("reload", cmd_reload))
-    app.add_handler(CommandHandler("status", cmd_status))
-    app.add_handler(CommandHandler("id",     cmd_id))
-    app.add_handler(CommandHandler("plan",   cmd_plan))
-    app.add_handler(CommandHandler("whatif", cmd_whatif))
-    app.add_handler(CommandHandler("actual", cmd_actual))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, router))
+    app.add_handler(CommandHandler("start", start_cmd))
+    app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("reload", reload_cmd))
+    app.add_handler(CommandHandler("status", status_cmd))
+    app.add_handler(CommandHandler("id", id_cmd))
 
-    # Schedule daily summary (21:35 IST)
+    # Text router for plain messages
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
+
+    # Jobs
     schedule_daily_summary(app)
 
     LOG.info("✅ Bot ready. Polling…")
-    app.run_polling()
+    app.run_polling(close_loop=False)
 
 if __name__ == "__main__":
     main()
