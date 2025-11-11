@@ -304,10 +304,16 @@ async def handle_msg(u,c):
 # ---------- APP ----------
 def main():
     load_state()
-    app=Application.builder().token(TOKEN).build()
-    app.add_handler(CommandHandler("start",cmd_start))
-    app.add_handler(CommandHandler("help",cmd_help))
-    app.add_handler(CommandHandler("reload",cmd_reload))
-    app.add_handler(CommandHandler("id",cmd_id))
-    app.add_handler(CommandHandler("status",cmd_status))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,handle
+    app = Application.builder().token(TOKEN).build()
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("reload", cmd_reload))
+    app.add_handler(CommandHandler("id", cmd_id))
+    app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_msg))
+
+    LOG.info("🚀 PyroVision Assistant running...")
+    app.run_polling()
+
+if __name__ == "__main__":
+    main()
