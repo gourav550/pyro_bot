@@ -684,8 +684,29 @@ async def main():
     scheduler.add_job(daily_summary_job, 'cron', hour=21, minute=35, args=[app])
     scheduler.start()
 
-    LOG.info("✅ PyroVision Assistant running...")
-    await app.run_polling()
+    LOG.info("✅ PyroVision Assistant running (initialize & start)...")
+
+    # Instead of await app.run_polling() which may cause "event loop already running" in some hosts,
+    # we manually initialize/start and then wait on an asyncio Event. This avoids nested run_until_complete
+    # calls and allows the process to be run in environments where an event loop already exists.
+    await app.initialize()
+    await app.start()
+
+    stop_event = asyncio.Event()
+    try:
+        # keep running until stop_event is set or KeyboardInterrupt
+        await stop_event.wait()
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        LOG.info("Shutdown requested, stopping...")
+    finally:
+        try:
+            await app.stop()
+        except Exception as e:
+            LOG.warning("Error during app.stop(): %s", e)
+        try:
+            await app.shutdown()
+        except Exception as e:
+            LOG.warning("Error during app.shutdown(): %s", e)
 
 # safe startup wrapper -> works when an event loop already exists (e.g., in some containers)
 def _start_bot_safely():
@@ -696,6 +717,7 @@ def _start_bot_safely():
 
     if loop and loop.is_running():
         LOG.info("Detected running event loop — scheduling bot as a task.")
+        # schedule main as a task on existing loop
         asyncio.create_task(main())
     else:
         LOG.info("No running event loop — launching bot with asyncio.run().")
