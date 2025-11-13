@@ -17,7 +17,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from telegram import ParseMode
+from telegram.constrants import ParseMode
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 
 # ---- logging ----
@@ -674,3 +674,4 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         LOG.info("Shutting down...")
+
