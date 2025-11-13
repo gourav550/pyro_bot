@@ -1,12 +1,9 @@
-# bot.py -- PyroVision Assistant (final)
+# bot.py -- PyroVision Assistant (final, corrected)
 # Ensure env vars:
 #   TELEGRAM_BOT_TOKEN (required)
 #   SUMMARY_CHAT_ID (optional, numeric)
 #   REPORT_PATH (optional path to Excel)
 #   MACHINE_MAP (optional JSON string mapping chat_id -> label)
-#
-# Example MACHINE_MAP:
-#   '{"-4923260341":"Machine 1296 (R-1)","-4859362706":"Machine 1297 (R-2)"}'
 
 import os
 import io
@@ -99,9 +96,14 @@ def to_hhmmss(minutes):
     except Exception:
         return "00:00:00"
 
-def minutes_to_hhmm(minutes):
+def minutes_to_hhmm(int_minutes):
+    """
+    Convert integer minutes to signed H:MM string.
+    Expects integer (may be negative). No rounding; use exact integer.
+    Example: -91 -> '-1:31', 15 -> '0:15'
+    """
     try:
-        m = int(round(minutes))
+        m = int(int_minutes)
         sign = "-" if m < 0 else ""
         mn = abs(m)
         h, rem = divmod(mn, 60)
@@ -580,25 +582,47 @@ async def handle_actual(update, context):
     if actual_oil is not None:
         out_lines.append(f"\n🛢️ *Predicted vs Actual Oil:* {pred}% → {actual_oil}% (conf {conf})")
 
+    # --- build zone_entries using INTEGER minutes (truncate seconds) ---
     zone_entries = []
-    for z,pmin in plan.items():
-        key = z.replace(" ","")
+    for z, pmin in plan.items():
+        # truncate plan fractional minutes (ignore seconds)
+        try:
+            plan_min_int = int(math.floor(float(pmin)))
+        except Exception:
+            plan_min_int = int(round(float(pmin or 0.0)))
+
+        key = z.replace(" ", "")
         m = re.match(r"(\d{2,3}-\d{2,3})", z)
         kshort = m.group(1) if m else z
-        if key in actual:
-            a_min = actual[key]
-            dev_min = a_min - pmin
-            zone_entries.append((z, dev_min))
-        elif kshort in actual:
-            a_min = actual[kshort]
-            dev_min = a_min - pmin
-            zone_entries.append((z, dev_min))
 
+        found = False
+        actual_min_int = None
+        if key in actual:
+            try:
+                a_raw = float(actual[key])
+                actual_min_int = int(math.floor(a_raw))
+                found = True
+            except Exception:
+                found = False
+        elif kshort in actual:
+            try:
+                a_raw = float(actual[kshort])
+                actual_min_int = int(math.floor(a_raw))
+                found = True
+            except Exception:
+                found = False
+
+        if found and actual_min_int is not None:
+            dev_min_int = actual_min_int - plan_min_int  # actual - plan
+            zone_entries.append((z, plan_min_int, actual_min_int, dev_min_int))
+
+    # --- display deviations using integer minutes ---
     if zone_entries:
         out_lines.append("\n📊 Deviation vs plan (min & hh:mm):")
-        for z, dev in zone_entries:
-            mm = int(round(dev))
+        for z, plan_min_int, actual_min_int, dev_min_int in zone_entries:
+            mm = int(dev_min_int)  # signed integer minutes
             hhmm = minutes_to_hhmm(mm)
+            # mm displayed with explicit sign
             out_lines.append(f"• {z}: {mm:+d} min ({hhmm})")
     else:
         out_lines.append("\n📊 Deviation vs plan (min):\n(no matching zones found in your message)")
@@ -616,11 +640,11 @@ async def handle_actual(update, context):
 
     if zone_entries:
         out_lines.append("\n🔧 Quick zone moves (mins):")
-        for z, dev in zone_entries:
-            delta = -int(round(dev))
+        for z, plan_min_int, actual_min_int, dev_min_int in zone_entries:
+            delta = -int(dev_min_int)  # suggestion = -dev (if actual longer than plan, suggest negative move to cut)
             if abs(delta) < 3:
                 continue
-            sign = "+" if delta>0 else ""
+            sign = "+" if delta > 0 else ""
             out_lines.append(f"• {z}: {sign}{delta} min")
     save_state()
 
@@ -691,25 +715,32 @@ async def main():
 
     LOG.info("✅ PyroVision Assistant running (initialize & start)...")
 
-    # start application (works both when there's an existing event loop or not)
+    # Start app in a way that works across many environments:
     await app.initialize()
     await app.start()
+
+    # Try the older updater.start_polling if available (works in some setups),
+    # otherwise fall back to run_polling which is the standard approach.
     try:
-        # run polling to receive messages
-        await app.updater.start_polling()  # stable across versions; if your version lacks updater, app.run_polling will work below
-    except Exception:
-        # fallback to run_polling if updater approach not supported
+        updater = getattr(app, "updater", None)
+        if updater and hasattr(updater, "start_polling"):
+            LOG.info("Using updater.start_polling()")
+            await updater.start_polling()
+        else:
+            LOG.info("Using app.run_polling()")
+            await app.run_polling()
+    except Exception as e:
+        LOG.warning("Polling start failed, fallback to run_polling(): %s", e)
         try:
             await app.run_polling()
-        except Exception as e:
-            LOG.warning("Polling fallback failed: %s", e)
-
-    # keep running until shutdown (rarely reached because start_polling is blocking in most versions)
-    try:
-        while True:
-            await asyncio.sleep(3600)
-    except (asyncio.CancelledError, KeyboardInterrupt):
-        LOG.info("Shutdown requested.")
+        except Exception as e2:
+            LOG.error("run_polling also failed: %s", e2)
+            # if polling fails, keep the app started and sleep loop; handlers still work in some hosts
+            try:
+                while True:
+                    await asyncio.sleep(3600)
+            except (asyncio.CancelledError, KeyboardInterrupt):
+                LOG.info("Shutdown requested.")
     finally:
         try:
             await app.stop()
