@@ -1,5 +1,12 @@
-# bot.py -- PyroVision Assistant (fixed, full)
-# Ensure env vars: TELEGRAM_BOT_TOKEN (required), SUMMARY_CHAT_ID (optional), REPORT_PATH (optional), MACHINE_MAP (optional JSON)
+# bot.py -- PyroVision Assistant (final)
+# Ensure env vars:
+#   TELEGRAM_BOT_TOKEN (required)
+#   SUMMARY_CHAT_ID (optional, numeric)
+#   REPORT_PATH (optional path to Excel)
+#   MACHINE_MAP (optional JSON string mapping chat_id -> label)
+#
+# Example MACHINE_MAP:
+#   '{"-4923260341":"Machine 1296 (R-1)","-4859362706":"Machine 1297 (R-2)"}'
 
 import os
 import io
@@ -29,7 +36,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(
 # ---- config via env ----
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 SUMMARY_CHAT_ID = int(os.getenv("SUMMARY_CHAT_ID", "0") or "0")
-REPORT_PATH = os.getenv("REPORT_PATH", "pyrolysis/feed/pyrolysis_feed_temp_ZONE_TIME_report.xlsx") if os.getenv("REPORT_PATH") else os.getenv("REPORT_PATH", "pyrolysis_feed_temp_ZONE_TIME_report.xlsx")
+REPORT_PATH = os.getenv("REPORT_PATH", "pyrolysis_feed_temp_ZONE_TIME_report.xlsx")
 BOT_TZ = ZoneInfo(os.getenv("BOT_TZ", "Asia/Kolkata"))
 
 try:
@@ -96,8 +103,8 @@ def minutes_to_hhmm(minutes):
     try:
         m = int(round(minutes))
         sign = "-" if m < 0 else ""
-        m = abs(m)
-        h, rem = divmod(m, 60)
+        mn = abs(m)
+        h, rem = divmod(mn, 60)
         return f"{sign}{h}:{rem:02d}"
     except Exception:
         return "0:00"
@@ -413,7 +420,6 @@ async def daily_summary_job(app):
                 if hrs <= 12 and not completed:
                     status = f"Running (batch {lf.get('batch','?')})"
                 elif completed:
-                    # show completed with date & weekday
                     comp_date = _norm_date(lf.get("date"))
                     status = f"Completed (batch {lf.get('batch','?')}) — {comp_date}"
                 else:
@@ -505,6 +511,7 @@ async def cmd_status(update, context):
 
 async def handle_message(update, context):
     txt = (update.message.text or "").strip()
+    # support both "/Feed: ..." and "Feed: ..." forms
     if re.match(r"^/?feed\s*:", txt, flags=re.I) or re.search(r"\bfeed\s*:", txt, flags=re.I):
         await handle_feed(update, context); return
     if re.match(r"^/?actual\s*:", txt, flags=re.I) or re.search(r"^actual\s*:", txt, flags=re.I):
@@ -622,7 +629,6 @@ async def handle_actual(update, context):
         buf = bar_plan_vs_actual(plan, actual)
         msg_txt = "\n".join(out_lines)
         await update.message.reply_text(msg_txt, parse_mode=ParseMode.MARKDOWN)
-        # send image
         buf.seek(0)
         await update.message.reply_photo(photo=InputFile(buf, filename="plan_vs_actual.png"))
     except Exception as e:
@@ -669,6 +675,7 @@ async def main():
 
     app = ApplicationBuilder().token(TOKEN).build()
 
+    # register handlers
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("id", cmd_id))
@@ -678,36 +685,32 @@ async def main():
 
     # Scheduler: schedule coroutine functions directly (pass app as arg)
     scheduler = AsyncIOScheduler(timezone=BOT_TZ)
-    # reminder_tick every hour (start ~10s after launch)
     scheduler.add_job(reminder_tick, 'interval', hours=1, next_run_time=datetime.now(BOT_TZ)+timedelta(seconds=10), args=[app])
-    # daily summary at 21:35 IST
     scheduler.add_job(daily_summary_job, 'cron', hour=21, minute=35, args=[app])
     scheduler.start()
 
     LOG.info("✅ PyroVision Assistant running (initialize & start)...")
 
-    # initialize and start app, then start polling (this is the step that was missing earlier)
+    # start application (works both when there's an existing event loop or not)
     await app.initialize()
     await app.start()
-
-    # start polling so handlers get incoming messages
     try:
-        await app.start_polling()
-    except Exception as e:
-        LOG.warning("start_polling() failed: %s", e)
-
-    # keep running until cancelled
-    stop_event = asyncio.Event()
-    try:
-        await stop_event.wait()
-    except (KeyboardInterrupt, asyncio.CancelledError):
-        LOG.info("Shutdown requested, stopping...")
-    finally:
-        # stop polling and shutdown cleanly
+        # run polling to receive messages
+        await app.updater.start_polling()  # stable across versions; if your version lacks updater, app.run_polling will work below
+    except Exception:
+        # fallback to run_polling if updater approach not supported
         try:
-            await app.stop_polling()
+            await app.run_polling()
         except Exception as e:
-            LOG.warning("Error during app.stop_polling(): %s", e)
+            LOG.warning("Polling fallback failed: %s", e)
+
+    # keep running until shutdown (rarely reached because start_polling is blocking in most versions)
+    try:
+        while True:
+            await asyncio.sleep(3600)
+    except (asyncio.CancelledError, KeyboardInterrupt):
+        LOG.info("Shutdown requested.")
+    finally:
         try:
             await app.stop()
         except Exception as e:
@@ -726,7 +729,6 @@ def _start_bot_safely():
 
     if loop and loop.is_running():
         LOG.info("Detected running event loop — scheduling bot as a task.")
-        # schedule main as a task on existing loop
         asyncio.create_task(main())
     else:
         LOG.info("No running event loop — launching bot with asyncio.run().")
