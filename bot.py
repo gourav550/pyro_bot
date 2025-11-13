@@ -1,5 +1,5 @@
-# bot.py -- PyroVision Assistant (fixed)
-# Paste and run. Ensure env vars: TELEGRAM_BOT_TOKEN, SUMMARY_CHAT_ID (optional), REPORT_PATH, MACHINE_MAP.
+# bot.py -- PyroVision Assistant (fixed, full)
+# Ensure env vars: TELEGRAM_BOT_TOKEN (required), SUMMARY_CHAT_ID (optional), REPORT_PATH (optional), MACHINE_MAP (optional JSON)
 
 import os
 import io
@@ -7,6 +7,7 @@ import re
 import json
 import math
 import logging
+import asyncio
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -17,6 +18,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from telegram import InputFile
 from telegram.constants import ParseMode
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 
@@ -47,9 +49,9 @@ state = {
         "kachra": 0.40,
         "others": 0.40,
     },
-    "latest_feed": {},
-    "last_actual_ts": {},
-    "reminders": {},
+    "latest_feed": {},    # chat_id -> feed record
+    "last_actual_ts": {}, # chat_id -> iso ts
+    "reminders": {},      # "chat:batch" -> {"chat_id":..., "batch":..., "due":iso}
     "mix_mean": None,
     "errors": []
 }
@@ -82,11 +84,8 @@ def to_hhmmss(minutes):
         if minutes is None or (isinstance(minutes, float) and math.isnan(minutes)):
             return "00:00:00"
         total = int(round(float(minutes) * 60))
-        if total < 0:
-            sign = "-"
-            total = -total
-        else:
-            sign = ""
+        sign = "-" if total < 0 else ""
+        total = abs(total)
         h, rem = divmod(total, 3600)
         m, s = divmod(rem, 60)
         return f"{sign}{h:02d}:{m:02d}:{s:02d}"
@@ -106,7 +105,10 @@ def minutes_to_hhmm(minutes):
 def hhmmss_to_minutes(s: str) -> float:
     s = (s or "").strip()
     if ":" not in s:
-        return float(s or 0.0)
+        try:
+            return float(s or 0.0)
+        except Exception:
+            return 0.0
     parts = [int(x) for x in s.split(":")]
     if len(parts) == 3:
         h, m, se = parts
@@ -139,7 +141,7 @@ def _norm_date(s: str | None) -> str:
     except Exception:
         return datetime.now(BOT_TZ).strftime("%d-%b-%Y (%A)")
 
-# ---- Excel load ----
+# ---- Excel rules ----
 def load_zone_rules(path=REPORT_PATH, sheet="ZoneTime_Recommendations"):
     rules = {}
     try:
@@ -204,7 +206,7 @@ def parse_feed(text: str) -> dict:
         elif any(v2.endswith(s) for s in ("kg","kgs")):
             valkg = float(re.sub(r"[^\d.]", "", v2))
         else:
-            valkg = float(re.sub(r"[^\d.]", "", v2))
+            valkg = float(re.sub(r"[^\d.]", "", v2) or 0.0)
         data[lk] = valkg
     return data
 
@@ -385,6 +387,7 @@ async def reminder_tick(app):
                         await app.bot.send_message(SUMMARY_CHAT_ID, f"🔔 Reminder sent to {machine_label(cid)} for batch {bno}", parse_mode=ParseMode.MARKDOWN)
                 except Exception as e:
                     LOG.warning("Reminder send failed: %s", e)
+                # schedule next hourly ping
                 state["reminders"][key]["due"] = (now + timedelta(hours=1)).isoformat()
         except Exception as e:
             LOG.warning("reminder_tick parse failed for %s: %s", key, e)
@@ -410,7 +413,9 @@ async def daily_summary_job(app):
                 if hrs <= 12 and not completed:
                     status = f"Running (batch {lf.get('batch','?')})"
                 elif completed:
-                    status = f"Completed (batch {lf.get('batch','?')})"
+                    # show completed with date & weekday
+                    comp_date = _norm_date(lf.get("date"))
+                    status = f"Completed (batch {lf.get('batch','?')}) — {comp_date}"
                 else:
                     status = "Idle"
             except Exception:
@@ -491,20 +496,21 @@ async def cmd_status(update, context):
     pred, conf = lf.get("pred"), lf.get("conf")
     keys = ("radial","nylon","chips","powder")
     feed_line = ", ".join([f"{k.title()} {round(feed.get(k,0)/1000,3)}T" for k in keys if feed.get(k,0)])
-    txt = f"• *Machine:* {machine_label(cid_str)}\n• *Batch:* {lf.get('batch','?')}\n• Date: {_norm_date(lf.get('date'))}\n\nFeed: {feed_line}\nPredicted Oil: *{pred}%* (conf {conf})"
+    txt = (f"• *Machine:* {machine_label(cid_str)}\n"
+           f"• *Batch:* {lf.get('batch','?')}\n"
+           f"• Date: {_norm_date(lf.get('date'))}\n\n"
+           f"Feed: {feed_line}\n"
+           f"Predicted Oil: *{pred}%* (conf {conf})")
     await update.message.reply_text(txt, parse_mode=ParseMode.MARKDOWN)
 
 async def handle_message(update, context):
-    txt = update.message.text.strip()
+    txt = (update.message.text or "").strip()
     if re.match(r"^/?feed\s*:", txt, flags=re.I) or re.search(r"\bfeed\s*:", txt, flags=re.I):
-        await handle_feed(update, context)
-        return
+        await handle_feed(update, context); return
     if re.match(r"^/?actual\s*:", txt, flags=re.I) or re.search(r"^actual\s*:", txt, flags=re.I):
-        await handle_actual(update, context)
-        return
+        await handle_actual(update, context); return
     if re.match(r"^what\s+feed\s*:", txt, flags=re.I):
-        await handle_what_feed(update, context)
-        return
+        await handle_what_feed(update, context); return
     await update.message.reply_text("I didn't understand.\n\n" + HELP, parse_mode=ParseMode.MARKDOWN)
 
 async def handle_feed(update, context):
@@ -553,20 +559,20 @@ async def handle_actual(update, context):
     # clear reminders for this batch
     remk = kkey(cid, batch)
     if remk in state["reminders"]:
-        try:
-            del state["reminders"][remk]
-        except Exception:
-            pass
+        try: del state["reminders"][remk]
+        except Exception: pass
     save_state()
     lf = state["latest_feed"].get(cid)
     plan = lf.get("plan") if lf else ZONE_RULES
     pred, conf = (lf.get("pred"), lf.get("conf")) if lf else predict_yield({})
     actual_oil = actual.get("oil", None)
+
     out_lines = []
     out_lines.append(f"🧾 *Machine {machine_label(cid)} • Batch {batch}*")
     out_lines.append(f"• { _norm_date(lf.get('date') if lf else None) }")
     if actual_oil is not None:
         out_lines.append(f"\n🛢️ *Predicted vs Actual Oil:* {pred}% → {actual_oil}% (conf {conf})")
+
     zone_entries = []
     for z,pmin in plan.items():
         key = z.replace(" ","")
@@ -580,6 +586,7 @@ async def handle_actual(update, context):
             a_min = actual[kshort]
             dev_min = a_min - pmin
             zone_entries.append((z, dev_min))
+
     if zone_entries:
         out_lines.append("\n📊 Deviation vs plan (min & hh:mm):")
         for z, dev in zone_entries:
@@ -588,6 +595,7 @@ async def handle_actual(update, context):
             out_lines.append(f"• {z}: {mm:+d} min ({hhmm})")
     else:
         out_lines.append("\n📊 Deviation vs plan (min):\n(no matching zones found in your message)")
+
     if actual_oil is not None:
         tips = oil_yield_reco(pred, actual_oil, plan, actual)
         out_lines.append("\n🛠️ Recommendations to lift oil yield:")
@@ -598,6 +606,7 @@ async def handle_actual(update, context):
                 learn_from_actual(lf["feed"], actual_oil)
             except Exception as e:
                 LOG.warning("Learning failed: %s", e)
+
     if zone_entries:
         out_lines.append("\n🔧 Quick zone moves (mins):")
         for z, dev in zone_entries:
@@ -607,18 +616,21 @@ async def handle_actual(update, context):
             sign = "+" if delta>0 else ""
             out_lines.append(f"• {z}: {sign}{delta} min")
     save_state()
+
     # attach chart
     try:
         buf = bar_plan_vs_actual(plan, actual)
         msg_txt = "\n".join(out_lines)
         await update.message.reply_text(msg_txt, parse_mode=ParseMode.MARKDOWN)
-        await update.message.reply_photo(photo=buf)
+        # send image
+        buf.seek(0)
+        await update.message.reply_photo(photo=InputFile(buf, filename="plan_vs_actual.png"))
     except Exception as e:
         LOG.warning("chart send failed: %s", e)
         await update.message.reply_text("\n".join(out_lines), parse_mode=ParseMode.MARKDOWN)
 
 async def handle_what_feed(update, context):
-    txt = update.message.text
+    txt = update.message.text or ""
     m = re.search(r"target\s*=\s*([\d.]+)", txt)
     if not m:
         await update.message.reply_text("Please specify a `target=XX.X` oil% (e.g. `what feed: target=50.0`)", parse_mode=ParseMode.MARKDOWN)
@@ -645,6 +657,10 @@ async def handle_what_feed(update, context):
 
 # ---- main ----
 async def main():
+    if not TOKEN:
+        LOG.error("Missing TELEGRAM_BOT_TOKEN environment variable.")
+        return
+
     load_state()
     maybe_load_yield_weights()
     global ZONE_RULES, ENGINE
@@ -660,19 +676,33 @@ async def main():
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
+    # Scheduler: schedule coroutine functions directly (pass app as arg)
     scheduler = AsyncIOScheduler(timezone=BOT_TZ)
-    scheduler.add_job(lambda: app.create_task(reminder_tick(app)), 'interval', hours=1, next_run_time=datetime.now(BOT_TZ)+timedelta(seconds=10))
-    scheduler.add_job(lambda: app.create_task(daily_summary_job(app)), 'cron', hour=21, minute=35)
+    # reminder_tick every hour (start ~10s after launch)
+    scheduler.add_job(reminder_tick, 'interval', hours=1, next_run_time=datetime.now(BOT_TZ)+timedelta(seconds=10), args=[app])
+    # daily summary at 21:35 IST
+    scheduler.add_job(daily_summary_job, 'cron', hour=21, minute=35, args=[app])
     scheduler.start()
 
     LOG.info("✅ PyroVision Assistant running...")
     await app.run_polling()
 
-if __name__ == "__main__":
-    import asyncio
+# safe startup wrapper -> works when an event loop already exists (e.g., in some containers)
+def _start_bot_safely():
     try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        LOG.info("Shutting down...")
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
 
+    if loop and loop.is_running():
+        LOG.info("Detected running event loop — scheduling bot as a task.")
+        asyncio.create_task(main())
+    else:
+        LOG.info("No running event loop — launching bot with asyncio.run().")
+        try:
+            asyncio.run(main())
+        except KeyboardInterrupt:
+            LOG.info("Shutting down...")
 
+if __name__ == "__main__":
+    _start_bot_safely()
