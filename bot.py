@@ -29,7 +29,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(
 # ---- config via env ----
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 SUMMARY_CHAT_ID = int(os.getenv("SUMMARY_CHAT_ID", "0") or "0")
-REPORT_PATH = os.getenv("REPORT_PATH", "pyrolysis_feed_temp_ZONE_TIME_report.xlsx")
+REPORT_PATH = os.getenv("REPORT_PATH", "pyrolysis/feed/pyrolysis_feed_temp_ZONE_TIME_report.xlsx") if os.getenv("REPORT_PATH") else os.getenv("REPORT_PATH", "pyrolysis_feed_temp_ZONE_TIME_report.xlsx")
 BOT_TZ = ZoneInfo(os.getenv("BOT_TZ", "Asia/Kolkata"))
 
 try:
@@ -686,19 +686,28 @@ async def main():
 
     LOG.info("✅ PyroVision Assistant running (initialize & start)...")
 
-    # Instead of await app.run_polling() which may cause "event loop already running" in some hosts,
-    # we manually initialize/start and then wait on an asyncio Event. This avoids nested run_until_complete
-    # calls and allows the process to be run in environments where an event loop already exists.
+    # initialize and start app, then start polling (this is the step that was missing earlier)
     await app.initialize()
     await app.start()
 
+    # start polling so handlers get incoming messages
+    try:
+        await app.start_polling()
+    except Exception as e:
+        LOG.warning("start_polling() failed: %s", e)
+
+    # keep running until cancelled
     stop_event = asyncio.Event()
     try:
-        # keep running until stop_event is set or KeyboardInterrupt
         await stop_event.wait()
     except (KeyboardInterrupt, asyncio.CancelledError):
         LOG.info("Shutdown requested, stopping...")
     finally:
+        # stop polling and shutdown cleanly
+        try:
+            await app.stop_polling()
+        except Exception as e:
+            LOG.warning("Error during app.stop_polling(): %s", e)
         try:
             await app.stop()
         except Exception as e:
