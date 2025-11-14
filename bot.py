@@ -1,6 +1,5 @@
-# bot.py -- PyroVision Assistant (final consolidated)
-# Required env: TELEGRAM_BOT_TOKEN
-# Optional env: SUMMARY_CHAT_ID, REPORT_PATH, MACHINE_MAP, BOT_TZ, PYROVISION_DEBUG
+# bot.py -- PyroVision Assistant (robust start + fixed event-loop handling)
+# Ensure env vars: TELEGRAM_BOT_TOKEN, (optional) SUMMARY_CHAT_ID, REPORT_PATH, MACHINE_MAP, BOT_TZ
 
 import os
 import io
@@ -23,16 +22,14 @@ from telegram import InputFile
 from telegram.constants import ParseMode
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 
-# ---- logging ----
 LOG = logging.getLogger("pyro_bot")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
 
-# ---- config via env ----
+# ---------------- Config ----------------
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 SUMMARY_CHAT_ID = int(os.getenv("SUMMARY_CHAT_ID", "0") or "0")
 REPORT_PATH = os.getenv("REPORT_PATH", "pyrolysis_feed_temp_ZONE_TIME_report.xlsx")
 BOT_TZ = ZoneInfo(os.getenv("BOT_TZ", "Asia/Kolkata"))
-DEBUG_MODE = os.getenv("PYROVISION_DEBUG", "") in ("1", "true", "True")
 
 try:
     MACHINE_MAP = json.loads(os.getenv("MACHINE_MAP", "{}"))
@@ -41,7 +38,7 @@ except Exception:
 
 STATE_PATH = "bot_state.json"
 
-# ---- persistent state ----
+# ---------------- State ----------------
 state = {
     "weights": {
         "radial": 0.44,
@@ -58,7 +55,7 @@ state = {
     "errors": []
 }
 
-# ---- I/O helpers ----
+# ---------------- Helpers ----------------
 def save_state():
     try:
         with open(STATE_PATH, "w", encoding="utf-8") as f:
@@ -80,7 +77,6 @@ def load_state():
     state.setdefault("mix_mean", None)
     state.setdefault("errors", [])
 
-# ---- formatting helpers ----
 def to_hhmmss(minutes):
     try:
         if minutes is None or (isinstance(minutes, float) and math.isnan(minutes)):
@@ -95,12 +91,11 @@ def to_hhmmss(minutes):
         return "00:00:00"
 
 def minutes_to_hhmm(minutes):
-    """Return signed H:MM string.  Example: -91 -> -1:31"""
     try:
         m = int(round(minutes))
         sign = "-" if m < 0 else ""
-        m = abs(m)
-        h, rem = divmod(m, 60)
+        mn = abs(m)
+        h, rem = divmod(mn, 60)
         return f"{sign}{h}:{rem:02d}"
     except Exception:
         return "0:00"
@@ -144,7 +139,7 @@ def _norm_date(s: str | None) -> str:
     except Exception:
         return datetime.now(BOT_TZ).strftime("%d-%b-%Y (%A)")
 
-# ---- Excel rules ----
+# ---------------- Excel rules ----------------
 def load_zone_rules(path=REPORT_PATH, sheet="ZoneTime_Recommendations"):
     rules = {}
     try:
@@ -184,7 +179,7 @@ def maybe_load_yield_weights(path=REPORT_PATH, sheet="YieldWeights"):
     except Exception:
         pass
 
-# ---- parsing ----
+# ---------------- Parsing ----------------
 def parse_feed(text: str) -> dict:
     t = re.sub(r"^/?(plan|predict)?\s*feed\s*:\s*|^feed\s*:\s*", "", text, flags=re.I).strip()
     data = {}
@@ -222,8 +217,7 @@ def parse_actual(text: str) -> dict:
         k, v = [x.strip() for x in chunk.split("=", 1)]
         lk = k.lower()
         if re.match(r"\d{2,3}\s*-\s*\d{2,3}", lk):
-            zone = re.sub(r"\s+", "", lk)   # e.g. "50-200"
-            # store as "50-200" (no extra text) AND also "50-200reactor" not needed here
+            zone = re.sub(r"\s+", "", lk)
             out[zone] = hhmmss_to_minutes(v) if ":" in v else float(re.sub(r"[^\d.]", "", v) or 0.0)
         elif lk in ("oil","oil%","oilpct","oil_pct"):
             out["oil"] = float(re.sub(r"[^\d.]", "", v) or 0.0)
@@ -231,11 +225,11 @@ def parse_actual(text: str) -> dict:
             out["batch"] = v
     return out
 
-# ---- engine ----
+# ---------------- Engine + learning ----------------
 class RecoEngine:
-    def __init__(self, base_rules):
+    def __init__(self, base_rules: dict):
         self.defaults = dict(base_rules)
-    def plan(self, feed):
+    def plan(self, feed: dict) -> dict:
         plan = dict(self.defaults)
         total = sum(feed.get(k,0.0) for k in ("radial","nylon","chips","powder","kachra","others"))
         if total > 0:
@@ -251,14 +245,14 @@ class RecoEngine:
 
 ENGINE = RecoEngine(ZONE_RULES)
 
-def _normalize_mix(feed):
+def _normalize_mix(feed: dict) -> dict:
     keys = ("radial","nylon","chips","powder","kachra","others")
     total = sum(feed.get(k,0.0) for k in keys)
     if total <= 0:
         return {k:0.0 for k in keys}
     return {k: feed.get(k,0.0)/total for k in keys}
 
-def _update_mix_mean(mix_norm):
+def _update_mix_mean(mix_norm: dict):
     alpha = 0.10
     if not state.get("mix_mean"):
         state["mix_mean"] = dict(mix_norm)
@@ -267,13 +261,13 @@ def _update_mix_mean(mix_norm):
     for k,v in mix_norm.items():
         mm[k] = (1-alpha)*mm.get(k,0.0) + alpha*v
 
-def _recent_mae():
+def _recent_mae() -> float:
     errs = state.get("errors") or []
     if not errs:
         return 2.5
     return float(np.mean(errs))
 
-def predict_yield(feed):
+def predict_yield(feed: dict) -> tuple[float,float]:
     keys = ("radial","nylon","chips","powder","kachra","others")
     total = sum(feed.get(k,0.0) for k in keys)
     if total <= 0:
@@ -284,19 +278,19 @@ def predict_yield(feed):
         pred += (feed.get(k,0.0)/total) * (w[k]*100.0)
     pred = float(np.clip(pred, 30.0, 60.0))
     mae = _recent_mae()
-    mae_penalty = np.clip(mae/6.0, 0.0, 1.0) * 0.18   # slightly smaller penalty than before
+    mae_penalty = np.clip(mae/6.0, 0.0, 1.0) * 0.20
     mix_norm = _normalize_mix(feed)
     mm = state.get("mix_mean")
     if mm:
         l1 = sum(abs(mix_norm[k]-mm.get(k,0.0)) for k in mix_norm)
     else:
-        l1 = 0.25
-    sim_penalty = np.clip(l1/0.8, 0.0, 1.0) * 0.12    # slightly smaller penalty
-    conf = 0.96 - mae_penalty - sim_penalty
-    conf = float(np.clip(conf, 0.65, 0.94))  # upper cap 0.94 per your request (data still matters)
+        l1 = 0.3
+    sim_penalty = np.clip(l1/0.8, 0.0, 1.0) * 0.15
+    conf = 0.95 - mae_penalty - sim_penalty
+    conf = float(np.clip(conf, 0.60, 0.95))
     return (round(pred,2), round(conf,2))
 
-def learn_from_actual(feed, actual_oil_pct):
+def learn_from_actual(feed: dict, actual_oil_pct: float):
     keys = ("radial","nylon","chips","powder","kachra","others")
     total = sum(feed.get(k,0.0) for k in keys)
     if total > 0:
@@ -315,8 +309,8 @@ def learn_from_actual(feed, actual_oil_pct):
         state["errors"] = state["errors"][-40:]
     save_state()
 
-# ---- rendering ----
-def pretty_plan(plan):
+# ---------------- Render ----------------
+def pretty_plan(plan: dict) -> str:
     def keyer(x):
         m = re.match(r"(\d{2,3})-(\d{2,3})", x)
         if not m: return (999,999,x)
@@ -326,13 +320,12 @@ def pretty_plan(plan):
         lines.append(f"{z}: {to_hhmmss(plan[z])}")
     return "\n".join(lines)
 
-def bar_plan_vs_actual(plan, actual):
+def bar_plan_vs_actual(plan: dict, actual: dict) -> io.BytesIO:
     zones = [z for z in sorted(plan.keys(), key=lambda s: int(s.split("-")[0]))]
     pmins = [plan[z] for z in zones]
     amins = []
     amap = {}
     if actual:
-        # actual contains keys like "50-200": minutes (float)
         amap = {k.replace(" ",""):v for k,v in actual.items() if "-" in k or re.match(r"\d{2,3}-\d{2,3}", k)}
     for z in zones:
         amins.append(amap.get(z.replace(" ",""), np.nan))
@@ -353,8 +346,8 @@ def bar_plan_vs_actual(plan, actual):
     buf.seek(0)
     return buf
 
-# ---- heuristics ----
-def oil_yield_reco(pred, actual, plan, actual_zones):
+# ---------------- Heuristics ----------------
+def oil_yield_reco(pred: float, actual: float, plan: dict, actual_zones: dict) -> list[str]:
     delta = actual - pred
     tips = []
     if delta < -2.0:
@@ -369,7 +362,7 @@ def oil_yield_reco(pred, actual, plan, actual_zones):
         tips.append("Yield on or near target; maintain steady ramp and 300–400 recovery.")
     return tips
 
-# ---- scheduler jobs ----
+# ---------------- Scheduler jobs ----------------
 def kkey(chat_id, batch):
     return f"{chat_id}:{batch or ''}"
 
@@ -399,7 +392,7 @@ async def reminder_tick(app):
 
 async def daily_summary_job(app):
     now = datetime.now(BOT_TZ)
-    lines = [f"📊 *Daily Summary* — {now.strftime('%d-%b-%Y (%A) %H:%M')} {BOT_TZ}"]
+    lines = [f"📊 *Daily Summary* — {now.strftime('%d-%b-%Y (%A) %H:%M')} IST"]
     for cid_str, label in MACHINE_MAP.items():
         lf = state["latest_feed"].get(cid_str)
         status = "Idle"
@@ -430,14 +423,14 @@ async def daily_summary_job(app):
         except Exception as e:
             LOG.warning("Daily summary send failed: %s", e)
 
-# ---- handlers + logic fixes ----
+# ---------------- Handlers ----------------
 HELP = (
     "*Commands*\n"
     "• Send *Feed:* `Feed: Radial=5.1T, Nylon=0.6T, Chips=3.4T, Powder=1.5T, batch=92, operator=Ravi, date=09-11-2025`\n"
     "  → Plan + Predicted oil.\n"
     "• Send *Actual:* `Actual: 50-200=01:14, 200-300=01:06, 300-400=02:07, 400-450=01:10, 450-480=00:32, oil=40.7; batch=92`\n"
     "  → Deviation + Oil recommendations + chart.\n"
-    "• `/status` → Machine status\n"
+    "• `/status` → Machine status (or all in Summary chat)\n"
     "• `/reload` → Reload Excel rules / weights\n"
     "• `/id` → Show this chat’s id and label\n"
     "• `what feed: target=50.0` → Suggest feed to aim for target oil%\n"
@@ -463,6 +456,33 @@ async def cmd_reload(update, context):
 
 async def cmd_status(update, context):
     now = datetime.now(BOT_TZ)
+    if SUMMARY_CHAT_ID and update.effective_chat.id == SUMMARY_CHAT_ID:
+        lines = ["🟢 *Machine Status*"]
+        for cid_str, label in MACHINE_MAP.items():
+            lf = state["latest_feed"].get(cid_str)
+            status = "Idle"
+            if lf:
+                try:
+                    lfts = datetime.fromisoformat(lf["ts"])
+                    if lfts.tzinfo is None: lfts = lfts.replace(tzinfo=BOT_TZ)
+                    hrs = (now - lfts).total_seconds()/3600
+                    last_act_iso = state["last_actual_ts"].get(cid_str)
+                    completed = False
+                    if last_act_iso:
+                        lat = datetime.fromisoformat(last_act_iso)
+                        if lat.tzinfo is None: lat = lat.replace(tzinfo=BOT_TZ)
+                        completed = lat >= lfts
+                    if hrs <= 12 and not completed:
+                        status = f"Running (batch {lf.get('batch','?')})"
+                    elif completed:
+                        status = f"Completed (batch {lf.get('batch','?')})"
+                    else:
+                        status = "Idle"
+                except Exception:
+                    status = "Idle"
+            lines.append(f"• {label}: {status}")
+        await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+        return
     cid_str = str(update.effective_chat.id)
     lf = state["latest_feed"].get(cid_str)
     if not lf:
@@ -481,20 +501,13 @@ async def cmd_status(update, context):
 
 async def handle_message(update, context):
     txt = (update.message.text or "").strip()
-    # accept both "Feed:" and "/Feed:" variants
     if re.match(r"^/?feed\s*:", txt, flags=re.I) or re.search(r"\bfeed\s*:", txt, flags=re.I):
         await handle_feed(update, context); return
     if re.match(r"^/?actual\s*:", txt, flags=re.I) or re.search(r"^actual\s*:", txt, flags=re.I):
         await handle_actual(update, context); return
     if re.match(r"^what\s+feed\s*:", txt, flags=re.I):
         await handle_what_feed(update, context); return
-    if DEBUG_MODE:
-        try:
-            await update.message.reply_text("debug: not a recognized command. Use Feed: or Actual:", parse_mode=ParseMode.MARKDOWN)
-        except Exception:
-            pass
-    else:
-        await update.message.reply_text("I didn't understand.\n\n" + HELP, parse_mode=ParseMode.MARKDOWN)
+    await update.message.reply_text("I didn't understand.\n\n" + HELP, parse_mode=ParseMode.MARKDOWN)
 
 async def handle_feed(update, context):
     txt = update.message.text
@@ -554,29 +567,26 @@ async def handle_actual(update, context):
     if actual_oil is not None:
         out_lines.append(f"\n🛢️ *Predicted vs Actual Oil:* {pred}% → {actual_oil}% (conf {conf})")
 
-    # Build zone_entries and compute deviations (rounded to nearest minute)
     zone_entries = []
-    for z, pmin in plan.items():
-        # canonical key for matching actual: "50-200" (no suffix)
-        m = re.match(r"(\d{2,3})-(\d{2,3})", z)
-        if not m:
-            continue
-        key_short = f"{m.group(1)}-{m.group(2)}"
-        # actual may contain "50-200" key
-        if key_short in actual:
-            a_min = actual[key_short]
-            # round both to nearest minute BEFORE dev calculation (prevents seconds causing big deltas)
-            a_min_rounded = round(a_min)
-            pmin_rounded = round(pmin)
-            dev_min = int(a_min_rounded - pmin_rounded)   # actual - plan (signed)
-            zone_entries.append((z, dev_min, int(pmin_rounded), int(a_min_rounded)))
+    for z,pmin in plan.items():
+        key = z.replace(" ","")
+        m = re.match(r"(\d{2,3}-\d{2,3})", z)
+        kshort = m.group(1) if m else z
+        if key in actual:
+            a_min = actual[key]
+            dev_min = a_min - pmin
+            zone_entries.append((z, dev_min))
+        elif kshort in actual:
+            a_min = actual[kshort]
+            dev_min = a_min - pmin
+            zone_entries.append((z, dev_min))
+
     if zone_entries:
         out_lines.append("\n📊 Deviation vs plan (min & hh:mm):")
-        for z, dev_min, p_rounded, a_rounded in zone_entries:
-            # mm shows signed minutes; hhmm shows signed H:MM
-            mm = dev_min
+        for z, dev in zone_entries:
+            mm = int(round(dev))
             hhmm = minutes_to_hhmm(mm)
-            out_lines.append(f"• {z}: {mm:+d} min ({hhmm})  — plan {minutes_to_hhmm(p_rounded)} vs actual {minutes_to_hhmm(a_rounded)}")
+            out_lines.append(f"• {z}: {mm:+d} min ({hhmm})")
     else:
         out_lines.append("\n📊 Deviation vs plan (min):\n(no matching zones found in your message)")
 
@@ -593,17 +603,14 @@ async def handle_actual(update, context):
 
     if zone_entries:
         out_lines.append("\n🔧 Quick zone moves (mins):")
-        for z, dev_min, p_rounded, a_rounded in zone_entries:
-            # dev_min = actual - plan
-            # if actual < plan -> dev_min negative -> we should INCREASE plan by abs(dev_min)
-            move = -dev_min   # minutes to ADD to plan (positive => add, negative => reduce)
-            if abs(move) < 1:
+        for z, dev in zone_entries:
+            delta = -int(round(dev))
+            if abs(delta) < 3:
                 continue
-            sign = "+" if move > 0 else ""
-            out_lines.append(f"• {z}: {sign}{move} min")
+            sign = "+" if delta>0 else ""
+            out_lines.append(f"• {z}: {sign}{delta} min")
     save_state()
 
-    # attach chart
     try:
         buf = bar_plan_vs_actual(plan, actual)
         msg_txt = "\n".join(out_lines)
@@ -640,7 +647,7 @@ async def handle_what_feed(update, context):
     lines.append("\nAlso use engine plan with proposed feed to get recommended zones.")
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
-# ---- main entry & polling safety ----
+# ---------------- Main / safe start ----------------
 async def main():
     if not TOKEN:
         LOG.error("Missing TELEGRAM_BOT_TOKEN environment variable.")
@@ -652,34 +659,15 @@ async def main():
     ZONE_RULES = load_zone_rules()
     ENGINE = RecoEngine(ZONE_RULES)
 
-    # best-effort: delete webhook to avoid getUpdates blocked by webhook
-    try:
-        import requests
-        requests.post(f"https://api.telegram.org/bot{TOKEN}/deleteWebhook", timeout=6)
-    except Exception:
-        pass
-
     app = ApplicationBuilder().token(TOKEN).build()
 
-    # register handlers
+    # handlers
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("id", cmd_id))
     app.add_handler(CommandHandler("reload", cmd_reload))
     app.add_handler(CommandHandler("status", cmd_status))
-    # message handlers
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    # accept commands with leading slash mapped to handle_message too
-    app.add_handler(MessageHandler(filters.COMMAND, handle_message))
-    # debug handler if enabled
-    if DEBUG_MODE:
-        async def _dbg(update, context):
-            try:
-                LOG.info("DEBUG incoming: %s", getattr(update.message, "text", None))
-                await update.message.reply_text("debug ok — message received")
-            except Exception:
-                pass
-        app.add_handler(MessageHandler(filters.ALL, _dbg), group=50)
 
     # scheduler
     scheduler = AsyncIOScheduler(timezone=BOT_TZ)
@@ -688,30 +676,59 @@ async def main():
     scheduler.start()
 
     LOG.info("✅ PyroVision Assistant running (polling)...")
-    # prefer run_polling which handles start/stop internally
+
+    # Initialize and start the app without trying to close the loop later.
     await app.initialize()
+    await app.start()
+
+    # start polling safely:
+    # prefer updater.start_polling() (non-blocking). If not available, fallback to run_polling() as a background task.
+    started_polling = False
     try:
-        await app.run_polling()
+        if getattr(app, "updater", None) and getattr(app.updater, "start_polling", None):
+            # start_polling is a coroutine in v20+: await it (it will not close loop)
+            await app.updater.start_polling()
+            started_polling = True
+        else:
+            # fallback: schedule run_polling as a background task
+            asyncio.create_task(app.run_polling())
+            started_polling = True
+    except Exception as e:
+        LOG.warning("Polling start attempt raised: %s", e)
+        try:
+            asyncio.create_task(app.run_polling())
+            started_polling = True
+        except Exception as e2:
+            LOG.error("Failed to start polling: %s", e2)
+
+    # Keep process alive until cancelled
+    stop_event = asyncio.Event()
+    try:
+        await stop_event.wait()
+    except (asyncio.CancelledError, KeyboardInterrupt):
+        LOG.info("Shutdown requested.")
     finally:
         try:
             await app.stop()
-        except Exception:
-            pass
+        except Exception as e:
+            LOG.warning("Error during app.stop(): %s", e)
         try:
             await app.shutdown()
-        except Exception:
-            pass
+        except Exception as e:
+            LOG.warning("Error during app.shutdown(): %s", e)
 
 def _start_bot_safely():
+    """Start main() safely whether or not an event loop already exists."""
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
         loop = None
+
     if loop and loop.is_running():
-        LOG.info("Detected running event loop — scheduling bot as a task.")
+        LOG.info("Detected running event loop — scheduling main() as a task.")
         asyncio.create_task(main())
     else:
-        LOG.info("No running event loop — launching bot with asyncio.run().")
+        LOG.info("No running event loop — launching with asyncio.run().")
         try:
             asyncio.run(main())
         except KeyboardInterrupt:
