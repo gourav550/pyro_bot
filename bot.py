@@ -101,20 +101,47 @@ def minutes_to_hhmm(minutes):
         return "0:00"
 
 def hhmmss_to_minutes(s: str) -> float:
+    """
+    Parse a time string into minutes (float).
+    - "HH:MM:SS" -> hours*60 + minutes + seconds/60
+    - "HH:MM"     -> hours*60 + minutes   (we treat 2-part as hours:minutes)
+    - "MM" or single number -> treated as minutes (float)
+    - accepts ":" or "." as separator (so "00.32" -> 0h32m)
+    """
     s = (s or "").strip()
-    if ":" not in s:
+    if not s:
+        return 0.0
+
+    # If it's a plain number (no separator), treat as minutes
+    if ":" not in s and "." not in s:
         try:
-            return float(s or 0.0)
+            return float(s)
         except Exception:
             return 0.0
-    parts = [int(x) for x in s.split(":")]
-    if len(parts) == 3:
-        h, m, se = parts
-        return h*60 + m + se/60
-    if len(parts) == 2:
-        m, se = parts
-        return m + se/60
-    return 0.0
+
+    # choose separator; prefer ":" if present
+    sep = ":" if ":" in s else "."
+    parts = [p for p in s.split(sep) if p != ""]
+
+    # make ints safely (ignore stray chars)
+    try:
+        parts_i = [int(re.sub(r"[^\d]", "", p) or 0) for p in parts]
+    except Exception:
+        # fallback: return 0
+        return 0.0
+
+    if len(parts_i) == 3:
+        h, m, sec = parts_i
+        return h*60 + m + sec/60.0
+    if len(parts_i) == 2:
+        # IMPORTANT: interpret as HH:MM (hours and minutes)
+        h, m = parts_i
+        return h*60 + m
+    # fallback
+    try:
+        return float(parts_i[0])
+    except Exception:
+        return 0.0
 
 def machine_label(chat_id):
     return MACHINE_MAP.get(str(chat_id)) or MACHINE_MAP.get(str(int(chat_id))) or str(chat_id)
@@ -218,7 +245,7 @@ def parse_actual(text: str) -> dict:
         lk = k.lower()
         if re.match(r"\d{2,3}\s*-\s*\d{2,3}", lk):
             zone = re.sub(r"\s+", "", lk)
-            out[zone] = hhmmss_to_minutes(v) if ":" in v else float(re.sub(r"[^\d.]", "", v) or 0.0)
+            out[zone] = hhmmss_to_minutes(v) if ":" in v or "." in v else float(re.sub(r"[^\d.]", "", v) or 0.0)
         elif lk in ("oil","oil%","oilpct","oil_pct"):
             out["oil"] = float(re.sub(r"[^\d.]", "", v) or 0.0)
         elif lk == "batch":
@@ -574,12 +601,13 @@ async def handle_actual(update, context):
         kshort = m.group(1) if m else z
         if key in actual:
             a_min = actual[key]
-            dev_min = a_min - pmin
-            zone_entries.append((z, dev_min))
+            # Compare integer minutes only (drop seconds) for deviation
+            dev_min = int(a_min) - int(pmin)
+            zone_entries.append((z, float(dev_min)))
         elif kshort in actual:
             a_min = actual[kshort]
-            dev_min = a_min - pmin
-            zone_entries.append((z, dev_min))
+            dev_min = int(a_min) - int(pmin)
+            zone_entries.append((z, float(dev_min)))
 
     if zone_entries:
         out_lines.append("\n📊 Deviation vs plan (min & hh:mm):")
@@ -682,15 +710,12 @@ async def main():
     await app.start()
 
     # start polling safely:
-    # prefer updater.start_polling() (non-blocking). If not available, fallback to run_polling() as a background task.
     started_polling = False
     try:
         if getattr(app, "updater", None) and getattr(app.updater, "start_polling", None):
-            # start_polling is a coroutine in v20+: await it (it will not close loop)
             await app.updater.start_polling()
             started_polling = True
         else:
-            # fallback: schedule run_polling as a background task
             asyncio.create_task(app.run_polling())
             started_polling = True
     except Exception as e:
